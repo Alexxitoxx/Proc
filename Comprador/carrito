@@ -1,0 +1,378 @@
+const express = require("express");
+
+function createCompradorCarritoRouter({ pool }) {
+	const router = express.Router();
+
+	function obtenerUsuarioSesion(req) {
+		return Number(req.session?.usuario_id || 0);
+	}
+
+	function requireSession(req, res) {
+		const idUsuario = obtenerUsuarioSesion(req);
+		if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
+			res.status(401).json({ mensaje: "Debes iniciar sesion" });
+			return null;
+		}
+		return idUsuario;
+	}
+
+	async function obtenerOCrearCarrito(client, idUsuario) {
+		const existente = await client.query(
+			"SELECT id FROM carrito WHERE id_usuario = $1 LIMIT 1",
+			[idUsuario]
+		);
+
+		if (existente.rows.length > 0) {
+			return existente.rows[0].id;
+		}
+
+		const creado = await client.query(
+			"INSERT INTO carrito (id_usuario) VALUES ($1) RETURNING id",
+			[idUsuario]
+		);
+
+		return creado.rows[0].id;
+	}
+
+	async function obtenerDetalleCarrito(idUsuario) {
+		const result = await pool.query(
+			`SELECT
+			   ci.id,
+			   ci.cantidad,
+			   ci.id_producto,
+			   ci.id_servicio,
+			   ci.id_agenda_seleccionada,
+			   p.nombre AS nombre_producto,
+			   p.precio AS precio_producto,
+			   s.nombre AS nombre_servicio,
+			   s.precio_base AS precio_servicio,
+			   COALESCE(np.nombre_comercial, ns.nombre_comercial, '') AS empresa,
+			   ag.fecha_hora_inicio,
+			   ag.fecha_hora_fin,
+			   ag.estado AS estado_agenda
+			 FROM carrito_items ci
+			 INNER JOIN carrito c ON c.id = ci.id_carrito
+			 LEFT JOIN productos p ON p.id = ci.id_producto
+			 LEFT JOIN negocios np ON np.id = p.id_negocio
+			 LEFT JOIN servicios s ON s.id = ci.id_servicio
+			 LEFT JOIN negocios ns ON ns.id = s.id_negocio
+			 LEFT JOIN agenda_servicios ag ON ag.id = ci.id_agenda_seleccionada
+			 WHERE c.id_usuario = $1
+			 ORDER BY ci.id DESC`,
+			[idUsuario]
+		);
+
+		const items = result.rows.map((item) => {
+			const esProducto = item.id_producto !== null;
+			const precioUnitario = esProducto
+				? Number(item.precio_producto || 0)
+				: Number(item.precio_servicio || 0);
+			const cantidad = Number(item.cantidad);
+			const subtotal = precioUnitario * cantidad;
+
+			return {
+				id_item: item.id,
+				tipo_item: esProducto ? "producto" : "servicio",
+				id_producto: item.id_producto,
+				id_servicio: item.id_servicio,
+				id_agenda_seleccionada: item.id_agenda_seleccionada,
+				nombre: esProducto ? item.nombre_producto : item.nombre_servicio,
+				empresa: item.empresa,
+				cantidad,
+				precio_unitario: precioUnitario,
+				subtotal,
+				agenda: item.id_agenda_seleccionada
+					? {
+						fecha_hora_inicio: item.fecha_hora_inicio,
+						fecha_hora_fin: item.fecha_hora_fin,
+						estado: item.estado_agenda,
+					}
+					: null,
+			};
+		});
+
+		const total = items.reduce((acum, item) => acum + item.subtotal, 0);
+
+		return {
+			total_items: items.length,
+			total: Number(total.toFixed(2)),
+			items,
+		};
+	}
+
+	// Crear carrito del usuario autenticado (si no existe)
+	router.post("/comprador/carrito", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const client = await pool.connect();
+		try {
+			const idCarrito = await obtenerOCrearCarrito(client, idUsuario);
+			return res.status(201).json({ mensaje: "Carrito disponible", id_carrito: idCarrito });
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al crear carrito" });
+		} finally {
+			client.release();
+		}
+	});
+
+	// Consultar carrito del usuario autenticado
+	router.get("/comprador/carrito", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const client = await pool.connect();
+		try {
+			await obtenerOCrearCarrito(client, idUsuario);
+			const carrito = await obtenerDetalleCarrito(idUsuario);
+			return res.status(200).json(carrito);
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al obtener carrito" });
+		} finally {
+			client.release();
+		}
+	});
+
+	// Agregar item al carrito del usuario autenticado
+	router.post("/comprador/carrito/items", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const { id_producto, id_servicio, id_agenda_seleccionada, cantidad } = req.body;
+		const idProducto = id_producto !== undefined && id_producto !== null ? Number(id_producto) : null;
+		const idServicio = id_servicio !== undefined && id_servicio !== null ? Number(id_servicio) : null;
+		const idAgenda =
+			id_agenda_seleccionada !== undefined && id_agenda_seleccionada !== null
+				? Number(id_agenda_seleccionada)
+				: null;
+		const cantidadNum = Number(cantidad || 1);
+
+		const tieneProducto = Number.isInteger(idProducto) && idProducto > 0;
+		const tieneServicio = Number.isInteger(idServicio) && idServicio > 0;
+
+		if (tieneProducto === tieneServicio) {
+			return res.status(400).json({ mensaje: "Debes enviar id_producto o id_servicio (solo uno)" });
+		}
+
+		if (!Number.isInteger(cantidadNum) || cantidadNum <= 0) {
+			return res.status(400).json({ mensaje: "Cantidad invalida" });
+		}
+
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+
+			const idCarrito = await obtenerOCrearCarrito(client, idUsuario);
+
+			if (tieneProducto) {
+				const producto = await client.query("SELECT id FROM productos WHERE id = $1 LIMIT 1", [idProducto]);
+				if (producto.rows.length === 0) {
+					await client.query("ROLLBACK");
+					return res.status(404).json({ mensaje: "Producto no encontrado" });
+				}
+
+				const existente = await client.query(
+					`SELECT id, cantidad
+					 FROM carrito_items
+					 WHERE id_carrito = $1 AND id_producto = $2 AND id_servicio IS NULL
+					 LIMIT 1`,
+					[idCarrito, idProducto]
+				);
+
+				if (existente.rows.length > 0) {
+					await client.query(
+						"UPDATE carrito_items SET cantidad = cantidad + $1 WHERE id = $2",
+						[cantidadNum, existente.rows[0].id]
+					);
+				} else {
+					await client.query(
+						"INSERT INTO carrito_items (id_carrito, id_producto, cantidad) VALUES ($1, $2, $3)",
+						[idCarrito, idProducto, cantidadNum]
+					);
+				}
+			} else {
+				const servicio = await client.query("SELECT id FROM servicios WHERE id = $1 LIMIT 1", [idServicio]);
+				if (servicio.rows.length === 0) {
+					await client.query("ROLLBACK");
+					return res.status(404).json({ mensaje: "Servicio no encontrado" });
+				}
+
+				if (idAgenda !== null) {
+					if (!Number.isInteger(idAgenda) || idAgenda <= 0) {
+						await client.query("ROLLBACK");
+						return res.status(400).json({ mensaje: "id_agenda_seleccionada invalido" });
+					}
+
+					const agenda = await client.query(
+						`SELECT id
+						 FROM agenda_servicios
+						 WHERE id = $1 AND id_servicio = $2
+						 LIMIT 1`,
+						[idAgenda, idServicio]
+					);
+
+					if (agenda.rows.length === 0) {
+						await client.query("ROLLBACK");
+						return res.status(404).json({ mensaje: "Agenda no encontrada para este servicio" });
+					}
+				}
+
+				await client.query(
+					`INSERT INTO carrito_items (id_carrito, id_servicio, id_agenda_seleccionada, cantidad)
+					 VALUES ($1, $2, $3, $4)`,
+					[idCarrito, idServicio, idAgenda, cantidadNum]
+				);
+			}
+
+			await client.query("COMMIT");
+			const carrito = await obtenerDetalleCarrito(idUsuario);
+			return res.status(201).json({ mensaje: "Item agregado al carrito", carrito });
+		} catch (error) {
+			await client.query("ROLLBACK");
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al agregar item al carrito" });
+		} finally {
+			client.release();
+		}
+	});
+
+	// Actualizar item del carrito del usuario autenticado
+	router.put("/comprador/carrito/items/:idItem", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const idItem = Number(req.params.idItem);
+		if (!Number.isInteger(idItem) || idItem <= 0) {
+			return res.status(400).json({ mensaje: "idItem invalido" });
+		}
+
+		const { cantidad, id_agenda_seleccionada } = req.body;
+		const cantidadNum = Number(cantidad);
+		const idAgenda =
+			id_agenda_seleccionada !== undefined && id_agenda_seleccionada !== null
+				? Number(id_agenda_seleccionada)
+				: null;
+
+		if (!Number.isInteger(cantidadNum) || cantidadNum <= 0) {
+			return res.status(400).json({ mensaje: "Cantidad invalida" });
+		}
+
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+
+			const item = await client.query(
+				`SELECT ci.id, ci.id_servicio
+				 FROM carrito_items ci
+				 INNER JOIN carrito c ON c.id = ci.id_carrito
+				 WHERE ci.id = $1 AND c.id_usuario = $2
+				 LIMIT 1`,
+				[idItem, idUsuario]
+			);
+
+			if (item.rows.length === 0) {
+				await client.query("ROLLBACK");
+				return res.status(404).json({ mensaje: "Item no encontrado en tu carrito" });
+			}
+
+			if (item.rows[0].id_servicio !== null && id_agenda_seleccionada !== undefined) {
+				if (idAgenda !== null && (!Number.isInteger(idAgenda) || idAgenda <= 0)) {
+					await client.query("ROLLBACK");
+					return res.status(400).json({ mensaje: "id_agenda_seleccionada invalido" });
+				}
+
+				if (idAgenda !== null) {
+					const agenda = await client.query(
+						`SELECT id
+						 FROM agenda_servicios
+						 WHERE id = $1 AND id_servicio = $2
+						 LIMIT 1`,
+						[idAgenda, item.rows[0].id_servicio]
+					);
+
+					if (agenda.rows.length === 0) {
+						await client.query("ROLLBACK");
+						return res.status(404).json({ mensaje: "Agenda no encontrada para este servicio" });
+					}
+				}
+
+				await client.query(
+					"UPDATE carrito_items SET cantidad = $1, id_agenda_seleccionada = $2 WHERE id = $3",
+					[cantidadNum, idAgenda, idItem]
+				);
+			} else {
+				await client.query("UPDATE carrito_items SET cantidad = $1 WHERE id = $2", [cantidadNum, idItem]);
+			}
+
+			await client.query("COMMIT");
+			const carrito = await obtenerDetalleCarrito(idUsuario);
+			return res.status(200).json({ mensaje: "Item actualizado", carrito });
+		} catch (error) {
+			await client.query("ROLLBACK");
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al actualizar item del carrito" });
+		} finally {
+			client.release();
+		}
+	});
+
+	// Eliminar item del carrito del usuario autenticado
+	router.delete("/comprador/carrito/items/:idItem", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const idItem = Number(req.params.idItem);
+		if (!Number.isInteger(idItem) || idItem <= 0) {
+			return res.status(400).json({ mensaje: "idItem invalido" });
+		}
+
+		try {
+			const eliminado = await pool.query(
+				`DELETE FROM carrito_items ci
+				 USING carrito c
+				 WHERE ci.id = $1
+				   AND ci.id_carrito = c.id
+				   AND c.id_usuario = $2
+				 RETURNING ci.id`,
+				[idItem, idUsuario]
+			);
+
+			if (eliminado.rows.length === 0) {
+				return res.status(404).json({ mensaje: "Item no encontrado en tu carrito" });
+			}
+
+			const carrito = await obtenerDetalleCarrito(idUsuario);
+			return res.status(200).json({ mensaje: "Item eliminado", carrito });
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al eliminar item del carrito" });
+		}
+	});
+
+	// Vaciar carrito del usuario autenticado
+	router.delete("/comprador/carrito", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		try {
+			await pool.query(
+				`DELETE FROM carrito_items ci
+				 USING carrito c
+				 WHERE ci.id_carrito = c.id
+				   AND c.id_usuario = $1`,
+				[idUsuario]
+			);
+
+			return res.status(200).json({ mensaje: "Carrito vaciado" });
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al vaciar carrito" });
+		}
+	});
+
+	return router;
+}
+
+module.exports = createCompradorCarritoRouter;

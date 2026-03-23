@@ -1,0 +1,500 @@
+const express = require("express");
+const crypto = require("crypto");
+
+function createCompradorCuentaRouter({ pool }) {
+	const router = express.Router();
+
+	function obtenerUsuarioSesion(req) {
+		return Number(req.session?.usuario_id || 0);
+	}
+
+	function hashPassword(password) {
+		return crypto.createHash("sha256").update(String(password)).digest("hex");
+	}
+
+	function requireSession(req, res) {
+		const idUsuario = obtenerUsuarioSesion(req);
+		if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
+			res.status(401).json({ mensaje: "Debes iniciar sesion" });
+			return null;
+		}
+		return idUsuario;
+	}
+
+	// Obtener informacion del usuario autenticado
+	router.get("/comprador/cuenta", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		try {
+			const result = await pool.query(
+				`SELECT
+				   u.id,
+				   u.nombre,
+				   u.email,
+				   u.telefono,
+				   COALESCE(r.nombre_rol, 'comprador') AS rol
+				 FROM usuarios u
+				 LEFT JOIN roles r ON r.id = u.id_rol
+				 WHERE u.id = $1
+				 LIMIT 1`,
+				[idUsuario]
+			);
+
+			if (result.rows.length === 0) {
+				return res.status(404).json({ mensaje: "Usuario no encontrado" });
+			}
+
+			const usuario = result.rows[0];
+			return res.status(200).json({
+				id: usuario.id,
+				nombre: usuario.nombre,
+				email: usuario.email,
+				telefono: usuario.telefono,
+				rol: usuario.rol,
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al obtener informacion de cuenta" });
+		}
+	});
+
+	// Actualizar informacion del usuario autenticado
+	router.put("/comprador/cuenta", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const { nombre, email, telefono } = req.body;
+
+		if (!nombre || !email) {
+			return res.status(400).json({ mensaje: "Nombre y email son obligatorios" });
+		}
+
+		try {
+			const existente = await pool.query(
+				"SELECT id FROM usuarios WHERE LOWER(email) = LOWER($1) AND id <> $2 LIMIT 1",
+				[String(email).trim(), idUsuario]
+			);
+
+			if (existente.rows.length > 0) {
+				return res.status(409).json({ mensaje: "El email ya esta en uso" });
+			}
+
+			const updated = await pool.query(
+				`UPDATE usuarios
+				 SET nombre = $1,
+				     email = LOWER($2),
+				     telefono = $3
+				 WHERE id = $4
+				 RETURNING id, nombre, email, telefono`,
+				[
+					String(nombre).trim(),
+					String(email).trim(),
+					telefono ? String(telefono).trim() : null,
+					idUsuario,
+				]
+			);
+
+			return res.status(200).json({
+				mensaje: "Informacion actualizada",
+				usuario: updated.rows[0],
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al actualizar informacion" });
+		}
+	});
+
+	// Agregar direccion del usuario autenticado
+	router.post("/comprador/cuenta/direcciones", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const {
+			calle,
+			ciudad,
+			estado,
+			codigo_postal,
+			pais,
+			es_principal,
+			tipo_direccion,
+			latitud,
+			longitud,
+		} = req.body;
+
+		if (!calle || !ciudad || !estado || !codigo_postal || !pais) {
+			return res.status(400).json({ mensaje: "Faltan campos obligatorios de direccion" });
+		}
+
+		const lat = Number(latitud);
+		const lng = Number(longitud);
+		const usarCoords = !Number.isNaN(lat) && !Number.isNaN(lng);
+
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+
+			if (es_principal === true) {
+				await client.query(
+					"UPDATE rel_usuario_direcciones SET es_principal = FALSE WHERE id_usuario = $1",
+					[idUsuario]
+				);
+			}
+
+			const direccion = await client.query(
+				`INSERT INTO direcciones (
+				   calle,
+				   ciudad,
+				   estado,
+				   codigo_postal,
+				   pais,
+				   geo_location
+				 )
+				 VALUES (
+				   $1, $2, $3, $4, $5,
+				   CASE WHEN $6 THEN ST_SetSRID(ST_MakePoint($7, $8), 4326)::geography
+				        ELSE ST_SetSRID(ST_MakePoint(0, 0), 4326)::geography
+				   END
+				 )
+				 RETURNING id`,
+				[
+					String(calle).trim(),
+					String(ciudad).trim(),
+					String(estado).trim(),
+					String(codigo_postal).trim(),
+					String(pais).trim(),
+					usarCoords,
+					usarCoords ? lng : 0,
+					usarCoords ? lat : 0,
+				]
+			);
+
+			await client.query(
+				`INSERT INTO rel_usuario_direcciones (id_usuario, id_direccion, es_principal, tipo_direccion)
+				 VALUES ($1, $2, $3, $4)`,
+				[idUsuario, direccion.rows[0].id, es_principal === true, tipo_direccion || "hogar"]
+			);
+
+			await client.query("COMMIT");
+			return res.status(201).json({
+				mensaje: "Direccion agregada",
+				id_direccion: direccion.rows[0].id,
+			});
+		} catch (error) {
+			await client.query("ROLLBACK");
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al agregar direccion" });
+		} finally {
+			client.release();
+		}
+	});
+
+	// Consultar direcciones del usuario autenticado
+	router.get("/comprador/cuenta/direcciones", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		try {
+			const result = await pool.query(
+				`SELECT
+				   d.id,
+				   d.calle,
+				   d.ciudad,
+				   d.estado,
+				   d.codigo_postal,
+				   d.pais,
+				   rud.es_principal,
+				   rud.tipo_direccion,
+				   ST_X(d.geo_location::geometry) AS longitud,
+				   ST_Y(d.geo_location::geometry) AS latitud
+				 FROM rel_usuario_direcciones rud
+				 INNER JOIN direcciones d ON d.id = rud.id_direccion
+				 WHERE rud.id_usuario = $1
+				 ORDER BY rud.es_principal DESC, d.id DESC`,
+				[idUsuario]
+			);
+
+			return res.status(200).json(result.rows);
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al obtener direcciones" });
+		}
+	});
+
+	// Eliminar direccion del usuario autenticado
+	router.delete("/comprador/cuenta/direcciones/:idDireccion", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const idDireccion = Number(req.params.idDireccion);
+		if (!Number.isInteger(idDireccion) || idDireccion <= 0) {
+			return res.status(400).json({ mensaje: "Id de direccion invalido" });
+		}
+
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+
+			const vinculada = await client.query(
+				`SELECT es_principal
+				 FROM rel_usuario_direcciones
+				 WHERE id_usuario = $1 AND id_direccion = $2
+				 LIMIT 1`,
+				[idUsuario, idDireccion]
+			);
+
+			if (vinculada.rows.length === 0) {
+				await client.query("ROLLBACK");
+				return res.status(404).json({ mensaje: "Direccion no encontrada para este usuario" });
+			}
+
+			const eraPrincipal = vinculada.rows[0].es_principal === true;
+
+			await client.query(
+				"DELETE FROM rel_usuario_direcciones WHERE id_usuario = $1 AND id_direccion = $2",
+				[idUsuario, idDireccion]
+			);
+
+			if (eraPrincipal) {
+				await client.query(
+					`UPDATE rel_usuario_direcciones
+					 SET es_principal = TRUE
+					 WHERE id_usuario = $1
+					   AND id_direccion = (
+						 SELECT id_direccion
+						 FROM rel_usuario_direcciones
+						 WHERE id_usuario = $1
+						 ORDER BY id_direccion DESC
+						 LIMIT 1
+					   )`,
+					[idUsuario]
+				);
+			}
+
+			await client.query(
+				`DELETE FROM direcciones d
+				 WHERE d.id = $1
+				   AND NOT EXISTS (
+					 SELECT 1
+					 FROM rel_usuario_direcciones rud
+					 WHERE rud.id_direccion = d.id
+				   )`,
+				[idDireccion]
+			);
+
+			await client.query("COMMIT");
+			return res.status(200).json({ mensaje: "Direccion eliminada" });
+		} catch (error) {
+			await client.query("ROLLBACK");
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al eliminar direccion" });
+		} finally {
+			client.release();
+		}
+	});
+
+	// Agregar metodo de pago del usuario autenticado
+	router.post("/comprador/cuenta/metodos-pago", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const { proveedor_pago, token_pasarela, ultimos_cuatro, fecha_expiracion } = req.body;
+
+		if (!proveedor_pago || !token_pasarela || !ultimos_cuatro || !fecha_expiracion) {
+			return res.status(400).json({ mensaje: "Faltan campos obligatorios del metodo de pago" });
+		}
+
+		const ultimosCuatroLimpio = String(ultimos_cuatro).trim();
+		if (!/^\d{4}$/.test(ultimosCuatroLimpio)) {
+			return res.status(400).json({ mensaje: "Los ultimos cuatro deben tener 4 digitos" });
+		}
+
+		const fechaExp = String(fecha_expiracion).trim();
+		if (!/^(0[1-9]|1[0-2])\/\d{2}$/.test(fechaExp)) {
+			return res.status(400).json({ mensaje: "La fecha de expiracion debe tener formato MM/YY" });
+		}
+
+		try {
+			const insertado = await pool.query(
+				`INSERT INTO metodos_pago (
+				   id_usuario,
+				   proveedor_pago,
+				   token_pasarela,
+				   ultimos_cuatro,
+				   fecha_expiracion
+				 )
+				 VALUES ($1, $2, $3, $4, $5)
+				 RETURNING id`,
+				[
+					idUsuario,
+					String(proveedor_pago).trim(),
+					String(token_pasarela).trim(),
+					ultimosCuatroLimpio,
+					fechaExp,
+				]
+			);
+
+			return res.status(201).json({
+				mensaje: "Metodo de pago agregado",
+				id_metodo_pago: insertado.rows[0].id,
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al agregar metodo de pago" });
+		}
+	});
+
+	// Consultar metodos de pago del usuario autenticado
+	router.get("/comprador/cuenta/metodos-pago", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		try {
+			const result = await pool.query(
+				`SELECT
+				   id,
+				   proveedor_pago,
+				   ultimos_cuatro,
+				   fecha_expiracion
+				 FROM metodos_pago
+				 WHERE id_usuario = $1
+				 ORDER BY id DESC`,
+				[idUsuario]
+			);
+
+			return res.status(200).json(result.rows);
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al obtener metodos de pago" });
+		}
+	});
+
+	// Eliminar metodo de pago del usuario autenticado
+	router.delete("/comprador/cuenta/metodos-pago/:idMetodoPago", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const idMetodoPago = Number(req.params.idMetodoPago);
+		if (!Number.isInteger(idMetodoPago) || idMetodoPago <= 0) {
+			return res.status(400).json({ mensaje: "Id de metodo de pago invalido" });
+		}
+
+		try {
+			const eliminado = await pool.query(
+				`DELETE FROM metodos_pago
+				 WHERE id = $1 AND id_usuario = $2
+				 RETURNING id`,
+				[idMetodoPago, idUsuario]
+			);
+
+			if (eliminado.rows.length === 0) {
+				return res.status(404).json({ mensaje: "Metodo de pago no encontrado para este usuario" });
+			}
+
+			return res.status(200).json({ mensaje: "Metodo de pago eliminado" });
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al eliminar metodo de pago" });
+		}
+	});
+
+	// Actualizar contrasena del usuario autenticado
+	router.put("/comprador/cuenta/contrasena", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const { password_actual, password_nueva } = req.body;
+
+		if (!password_actual || !password_nueva) {
+			return res.status(400).json({ mensaje: "Password actual y nueva son obligatorias" });
+		}
+
+		if (String(password_nueva).length < 8) {
+			return res.status(400).json({ mensaje: "La nueva password debe tener al menos 8 caracteres" });
+		}
+
+		try {
+			const usuario = await pool.query(
+				"SELECT password_hash FROM usuarios WHERE id = $1 AND activo = TRUE LIMIT 1",
+				[idUsuario]
+			);
+
+			if (usuario.rows.length === 0) {
+				return res.status(404).json({ mensaje: "Usuario no encontrado" });
+			}
+
+			const hashActual = hashPassword(password_actual);
+			const hashGuardado = usuario.rows[0].password_hash;
+
+			if (hashActual !== hashGuardado) {
+				return res.status(401).json({ mensaje: "La password actual es incorrecta" });
+			}
+
+			const hashNueva = hashPassword(password_nueva);
+			if (hashNueva === hashGuardado) {
+				return res.status(400).json({ mensaje: "La nueva password debe ser diferente a la actual" });
+			}
+
+			await pool.query("UPDATE usuarios SET password_hash = $1 WHERE id = $2", [hashNueva, idUsuario]);
+
+			return res.status(200).json({ mensaje: "Password actualizada" });
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al actualizar password" });
+		}
+	});
+
+	// Eliminar (desactivar) cuenta del usuario autenticado
+	router.delete("/comprador/cuenta", async (req, res) => {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return;
+
+		const { password_actual } = req.body;
+		if (!password_actual) {
+			return res.status(400).json({ mensaje: "La password actual es obligatoria" });
+		}
+
+		try {
+			const usuario = await pool.query(
+				"SELECT password_hash, activo FROM usuarios WHERE id = $1 LIMIT 1",
+				[idUsuario]
+			);
+
+			if (usuario.rows.length === 0) {
+				return res.status(404).json({ mensaje: "Usuario no encontrado" });
+			}
+
+			if (usuario.rows[0].activo !== true) {
+				return res.status(400).json({ mensaje: "La cuenta ya esta desactivada" });
+			}
+
+			const hashActual = hashPassword(password_actual);
+			if (hashActual !== usuario.rows[0].password_hash) {
+				return res.status(401).json({ mensaje: "La password actual es incorrecta" });
+			}
+
+			await pool.query(
+				"UPDATE usuarios SET activo = FALSE, fecha_eliminacion = NOW() WHERE id = $1",
+				[idUsuario]
+			);
+
+			req.session.destroy((sessionError) => {
+				if (sessionError) {
+					console.error(sessionError);
+					return res.status(500).json({ mensaje: "Cuenta desactivada, pero no se pudo cerrar sesion" });
+				}
+
+				return res.status(200).json({ mensaje: "Cuenta eliminada" });
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al eliminar cuenta" });
+		}
+	});
+
+
+
+	return router;
+}
+
+module.exports = createCompradorCuentaRouter;
