@@ -16,6 +16,32 @@ function createCompradorCarritoRouter({ pool }) {
 		return idUsuario;
 	}
 
+	async function requireActiveSession(req, res) {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return null;
+
+		try {
+			const usuarioActivo = await pool.query(
+				`SELECT id
+				 FROM usuarios
+				 WHERE id = $1
+				   AND activo = TRUE
+				   AND fecha_eliminacion IS NULL
+				 LIMIT 1`,
+				[idUsuario]
+			);
+
+			if (usuarioActivo.rows.length === 0) {
+				return res.status(401).json({ mensaje: "Sesion invalida o usuario inactivo" });
+			}
+
+			return idUsuario;
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al validar sesion" });
+		}
+	}
+
 	async function obtenerOCrearCarrito(client, idUsuario) {
 		const existente = await client.query(
 			"SELECT id FROM carrito WHERE id_usuario = $1 LIMIT 1",
@@ -58,6 +84,8 @@ function createCompradorCarritoRouter({ pool }) {
 			 LEFT JOIN negocios ns ON ns.id = s.id_negocio
 			 LEFT JOIN agenda_servicios ag ON ag.id = ci.id_agenda_seleccionada
 			 WHERE c.id_usuario = $1
+			   AND (ci.id_producto IS NULL OR p.esta_activo = TRUE)
+			   AND (ci.id_servicio IS NULL OR s.esta_activo = TRUE)
 			 ORDER BY ci.id DESC`,
 			[idUsuario]
 		);
@@ -100,9 +128,94 @@ function createCompradorCarritoRouter({ pool }) {
 		};
 	}
 
+	async function obtenerDireccionCheckout(client, idUsuario, idDireccion) {
+		const valores = [idUsuario];
+		let filtroDireccion = "";
+
+		if (idDireccion !== null) {
+			valores.push(idDireccion);
+			filtroDireccion = "AND d.id = $2";
+		}
+
+		const direccion = await client.query(
+			`SELECT
+			   d.id,
+			   d.calle,
+			   d.ciudad,
+			   d.estado,
+			   d.codigo_postal,
+			   d.pais,
+			   ST_X(d.geo_location::geometry) AS longitud,
+			   ST_Y(d.geo_location::geometry) AS latitud,
+			   rud.tipo_direccion,
+			   rud.es_principal
+			 FROM rel_usuario_direcciones rud
+			 INNER JOIN direcciones d ON d.id = rud.id_direccion
+			 WHERE rud.id_usuario = $1
+			   ${filtroDireccion}
+			 ORDER BY rud.es_principal DESC, d.id DESC
+			 LIMIT 1`,
+			valores
+		);
+
+		if (direccion.rows.length === 0) {
+			throw new Error("Direccion de envio no encontrada para el usuario");
+		}
+
+		const d = direccion.rows[0];
+		return {
+			id_direccion: d.id,
+			calle: d.calle,
+			ciudad: d.ciudad,
+			estado: d.estado,
+			codigo_postal: d.codigo_postal,
+			pais: d.pais,
+			latitud: d.latitud !== null ? Number(d.latitud) : null,
+			longitud: d.longitud !== null ? Number(d.longitud) : null,
+			tipo_direccion: d.tipo_direccion,
+			es_principal: d.es_principal === true,
+		};
+	}
+
+	async function obtenerMetodoPagoCheckout(client, idUsuario, idMetodoPago) {
+		const valores = [idUsuario];
+		let filtroMetodo = "";
+
+		if (idMetodoPago !== null) {
+			valores.push(idMetodoPago);
+			filtroMetodo = "AND id = $2";
+		}
+
+		const metodoPago = await client.query(
+			`SELECT
+			   id,
+			   proveedor_pago,
+			   ultimos_cuatro,
+			   fecha_expiracion
+			 FROM metodos_pago
+			 WHERE id_usuario = $1
+			   ${filtroMetodo}
+			 ORDER BY id DESC
+			 LIMIT 1`,
+			valores
+		);
+
+		if (metodoPago.rows.length === 0) {
+			throw new Error("Metodo de pago no encontrado para el usuario");
+		}
+
+		const m = metodoPago.rows[0];
+		return {
+			id_metodo_pago: m.id,
+			proveedor_pago: m.proveedor_pago,
+			ultimos_cuatro: m.ultimos_cuatro,
+			fecha_expiracion: m.fecha_expiracion,
+		};
+	}
+
 	// Crear carrito del usuario autenticado (si no existe)
 	router.post("/comprador/carrito", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const client = await pool.connect();
@@ -119,7 +232,7 @@ function createCompradorCarritoRouter({ pool }) {
 
 	// Consultar carrito del usuario autenticado
 	router.get("/comprador/carrito", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const client = await pool.connect();
@@ -137,7 +250,7 @@ function createCompradorCarritoRouter({ pool }) {
 
 	// Agregar item al carrito del usuario autenticado
 	router.post("/comprador/carrito/items", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const { id_producto, id_servicio, id_agenda_seleccionada, cantidad } = req.body;
@@ -167,10 +280,13 @@ function createCompradorCarritoRouter({ pool }) {
 			const idCarrito = await obtenerOCrearCarrito(client, idUsuario);
 
 			if (tieneProducto) {
-				const producto = await client.query("SELECT id FROM productos WHERE id = $1 LIMIT 1", [idProducto]);
+				const producto = await client.query(
+					"SELECT id, stock_total FROM productos WHERE id = $1 AND esta_activo = TRUE LIMIT 1",
+					[idProducto]
+				);
 				if (producto.rows.length === 0) {
 					await client.query("ROLLBACK");
-					return res.status(404).json({ mensaje: "Producto no encontrado" });
+					return res.status(404).json({ mensaje: "Producto no encontrado o inactivo" });
 				}
 
 				const existente = await client.query(
@@ -182,21 +298,35 @@ function createCompradorCarritoRouter({ pool }) {
 				);
 
 				if (existente.rows.length > 0) {
+					const nuevaCantidad = Number(existente.rows[0].cantidad) + cantidadNum;
+					if (nuevaCantidad > Number(producto.rows[0].stock_total || 0)) {
+						await client.query("ROLLBACK");
+						return res.status(400).json({ mensaje: "Stock insuficiente para la cantidad solicitada" });
+					}
+
 					await client.query(
 						"UPDATE carrito_items SET cantidad = cantidad + $1 WHERE id = $2",
 						[cantidadNum, existente.rows[0].id]
 					);
 				} else {
+					if (cantidadNum > Number(producto.rows[0].stock_total || 0)) {
+						await client.query("ROLLBACK");
+						return res.status(400).json({ mensaje: "Stock insuficiente para la cantidad solicitada" });
+					}
+
 					await client.query(
 						"INSERT INTO carrito_items (id_carrito, id_producto, cantidad) VALUES ($1, $2, $3)",
 						[idCarrito, idProducto, cantidadNum]
 					);
 				}
 			} else {
-				const servicio = await client.query("SELECT id FROM servicios WHERE id = $1 LIMIT 1", [idServicio]);
+				const servicio = await client.query(
+					"SELECT id FROM servicios WHERE id = $1 AND esta_activo = TRUE LIMIT 1",
+					[idServicio]
+				);
 				if (servicio.rows.length === 0) {
 					await client.query("ROLLBACK");
-					return res.status(404).json({ mensaje: "Servicio no encontrado" });
+					return res.status(404).json({ mensaje: "Servicio no encontrado o inactivo" });
 				}
 
 				if (idAgenda !== null) {
@@ -208,7 +338,7 @@ function createCompradorCarritoRouter({ pool }) {
 					const agenda = await client.query(
 						`SELECT id
 						 FROM agenda_servicios
-						 WHERE id = $1 AND id_servicio = $2
+						 WHERE id = $1 AND id_servicio = $2 AND estado = 'disponible'
 						 LIMIT 1`,
 						[idAgenda, idServicio]
 					);
@@ -240,7 +370,7 @@ function createCompradorCarritoRouter({ pool }) {
 
 	// Actualizar item del carrito del usuario autenticado
 	router.put("/comprador/carrito/items/:idItem", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const idItem = Number(req.params.idItem);
@@ -264,7 +394,7 @@ function createCompradorCarritoRouter({ pool }) {
 			await client.query("BEGIN");
 
 			const item = await client.query(
-				`SELECT ci.id, ci.id_servicio
+				`SELECT ci.id, ci.id_servicio, ci.id_producto
 				 FROM carrito_items ci
 				 INNER JOIN carrito c ON c.id = ci.id_carrito
 				 WHERE ci.id = $1 AND c.id_usuario = $2
@@ -277,6 +407,23 @@ function createCompradorCarritoRouter({ pool }) {
 				return res.status(404).json({ mensaje: "Item no encontrado en tu carrito" });
 			}
 
+			if (item.rows[0].id_producto !== null) {
+				const producto = await client.query(
+					"SELECT stock_total, esta_activo FROM productos WHERE id = $1 LIMIT 1",
+					[item.rows[0].id_producto]
+				);
+
+				if (producto.rows.length === 0 || producto.rows[0].esta_activo !== true) {
+					await client.query("ROLLBACK");
+					return res.status(404).json({ mensaje: "Producto no encontrado o inactivo" });
+				}
+
+				if (cantidadNum > Number(producto.rows[0].stock_total || 0)) {
+					await client.query("ROLLBACK");
+					return res.status(400).json({ mensaje: "Stock insuficiente para la cantidad solicitada" });
+				}
+			}
+
 			if (item.rows[0].id_servicio !== null && id_agenda_seleccionada !== undefined) {
 				if (idAgenda !== null && (!Number.isInteger(idAgenda) || idAgenda <= 0)) {
 					await client.query("ROLLBACK");
@@ -287,7 +434,7 @@ function createCompradorCarritoRouter({ pool }) {
 					const agenda = await client.query(
 						`SELECT id
 						 FROM agenda_servicios
-						 WHERE id = $1 AND id_servicio = $2
+						 WHERE id = $1 AND id_servicio = $2 AND estado = 'disponible'
 						 LIMIT 1`,
 						[idAgenda, item.rows[0].id_servicio]
 					);
@@ -320,7 +467,7 @@ function createCompradorCarritoRouter({ pool }) {
 
 	// Eliminar item del carrito del usuario autenticado
 	router.delete("/comprador/carrito/items/:idItem", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const idItem = Number(req.params.idItem);
@@ -353,7 +500,7 @@ function createCompradorCarritoRouter({ pool }) {
 
 	// Vaciar carrito del usuario autenticado
 	router.delete("/comprador/carrito", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		try {
@@ -369,6 +516,91 @@ function createCompradorCarritoRouter({ pool }) {
 		} catch (error) {
 			console.error(error);
 			return res.status(500).json({ mensaje: "Error al vaciar carrito" });
+		}
+	});
+
+	// Procesar compra/pedido desde el carrito
+	router.post("/comprador/carrito/checkout", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		const idDireccion =
+			req.body?.id_direccion !== undefined && req.body?.id_direccion !== null
+				? Number(req.body.id_direccion)
+				: null;
+		const idMetodoPago =
+			req.body?.id_metodo_pago !== undefined && req.body?.id_metodo_pago !== null
+				? Number(req.body.id_metodo_pago)
+				: null;
+
+		if (idDireccion !== null && (!Number.isInteger(idDireccion) || idDireccion <= 0)) {
+			return res.status(400).json({ mensaje: "id_direccion invalido" });
+		}
+
+		if (idMetodoPago !== null && (!Number.isInteger(idMetodoPago) || idMetodoPago <= 0)) {
+			return res.status(400).json({ mensaje: "id_metodo_pago invalido" });
+		}
+
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+
+			await obtenerOCrearCarrito(client, idUsuario);
+
+			const direccionSnapshot = await obtenerDireccionCheckout(client, idUsuario, idDireccion);
+			const metodoPagoSnapshot = await obtenerMetodoPagoCheckout(client, idUsuario, idMetodoPago);
+
+			const checkoutResult = await client.query(
+				"SELECT procesar_checkout($1, $2::jsonb, $3::jsonb) AS id_pedido",
+				[idUsuario, direccionSnapshot, metodoPagoSnapshot]
+			);
+
+			const idPedido = Number(checkoutResult.rows[0].id_pedido);
+
+			const pedidoResult = await client.query(
+				`SELECT id, total, estado_pedido, fecha_creacion
+				 FROM pedidos
+				 WHERE id = $1
+				 LIMIT 1`,
+				[idPedido]
+			);
+
+			await client.query("COMMIT");
+
+			if (pedidoResult.rows.length === 0) {
+				return res.status(201).json({
+					mensaje: "Pedido generado correctamente",
+					id_pedido: idPedido,
+				});
+			}
+
+			const pedido = pedidoResult.rows[0];
+			return res.status(201).json({
+				mensaje: "Pedido generado correctamente",
+				pedido: {
+					id: pedido.id,
+					total: Number(pedido.total),
+					estado_pedido: pedido.estado_pedido,
+					fecha_creacion: pedido.fecha_creacion,
+				},
+			});
+		} catch (error) {
+			await client.query("ROLLBACK");
+			console.error(error);
+
+			if (error && typeof error.message === "string") {
+				if (error.message.includes("carrito está vacío") || error.message.includes("carrito activo")) {
+					return res.status(400).json({ mensaje: error.message });
+				}
+
+				if (error.message.includes("Stock insuficiente")) {
+					return res.status(409).json({ mensaje: error.message });
+				}
+			}
+
+			return res.status(500).json({ mensaje: "Error al procesar checkout" });
+		} finally {
+			client.release();
 		}
 	});
 

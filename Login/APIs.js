@@ -52,10 +52,20 @@ function createLoginRouter({ pool }) {
       req.session.usuario_id = usuario.id;
       req.session.rol = usuario.nombre_rol.toLowerCase();
 
+      return res.status(200).json({
+        mensaje: "Sesion iniciada correctamente",
+        usuario: {
+          id: usuario.id,
+          nombre: usuario.nombre,
+          email: usuario.email,
+          rol: usuario.nombre_rol,
+        },
+      });
+
     } 
     catch (error) {
       console.error(error);
-      res.status(500).json({ mensaje: "Error del servidor" });
+      return res.status(500).json({ mensaje: "Error del servidor" });
     }
   });
 
@@ -107,11 +117,10 @@ function createLoginRouter({ pool }) {
          RETURNING id, nombre, email`,
         [rolSolicitado, nombreFinal, emailFinal, passwordHash, telefono || null]
       );
-
-      res.redirect("/login");
       
       return res.status(201).json({
         mensaje: "Usuario registrado correctamente",
+        usuario: creado.rows[0],
       });
 
     } catch (error) {

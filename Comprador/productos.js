@@ -3,11 +3,11 @@ const express = require("express");
 function createCompradorRouter({ pool }) {
   const router = express.Router();
 
-  // Obtener categorias para el front de comprador
-  router.get("/comprador/productos/categorias", async (req, res) => {
+  // Obtener categorias para el front 
+  router.get("/comprador/categorias", async (req, res) => {
     try {
       const result = await pool.query(
-        `SELECT id, nombre_categoria
+        `SELECT id, nombre_categoria, tipo
          FROM categorias
          ORDER BY nombre_categoria ASC`
       );
@@ -16,40 +16,12 @@ function createCompradorRouter({ pool }) {
         result.rows.map((categoria) => ({
           id: categoria.id,
           nombre: categoria.nombre_categoria,
+          tipo: categoria.tipo,
         }))
       );
     } catch (error) {
       console.error(error);
       return res.status(500).json({ mensaje: "Error al obtener categorias" });
-    }
-  });
-
-  // Obtener categorias para el front de servicios
-  router.get("/comprador/servicios/categorias", async (req, res) => {
-    try {
-      const result = await pool.query(
-        `SELECT
-           c.id,
-           c.nombre_categoria,
-           COUNT(DISTINCT s.id) AS total_servicios
-         FROM categorias c
-         INNER JOIN producto_categoria pc ON pc.id_categoria = c.id
-         INNER JOIN productos p ON p.id = pc.id_producto
-         INNER JOIN servicios s ON s.id_negocio = p.id_negocio
-         GROUP BY c.id, c.nombre_categoria
-         ORDER BY c.nombre_categoria ASC`
-      );
-
-      return res.status(200).json(
-        result.rows.map((categoria) => ({
-          id: categoria.id,
-          nombre: categoria.nombre_categoria,
-          total_servicios: Number(categoria.total_servicios),
-        }))
-      );
-    } catch (error) {
-      console.error(error);
-      return res.status(500).json({ mensaje: "Error al obtener categorias de servicios" });
     }
   });
 
@@ -121,14 +93,17 @@ function createCompradorRouter({ pool }) {
            p.nombre,
            p.calificacion,
            p.precio,
+           pi.url_imagen AS imagen_principal,
            COALESCE(n.nombre_comercial, '') AS empresa,
            COUNT(r.id) AS numero_resenas
          FROM productos p
          INNER JOIN producto_categoria pc ON pc.id_producto = p.id
          LEFT JOIN negocios n ON n.id = p.id_negocio
+         LEFT JOIN producto_imagenes pi ON pi.id_producto = p.id AND pi.es_principal = TRUE
          LEFT JOIN resenas r ON r.id_producto = p.id
-         WHERE ${filtros.join(" AND ")}
-         GROUP BY p.id, p.nombre, p.calificacion, p.precio, n.nombre_comercial, p.fecha_registro
+         WHERE p.esta_activo = TRUE
+           AND ${filtros.join(" AND ")}
+         GROUP BY p.id, p.nombre, p.calificacion, p.precio, pi.url_imagen, n.nombre_comercial, p.fecha_registro
          ORDER BY ${orderBy}`,
         valores
       );
@@ -161,15 +136,7 @@ function createCompradorRouter({ pool }) {
     }
 
     try {
-      const filtros = [
-        `EXISTS (
-           SELECT 1
-           FROM productos p
-           INNER JOIN producto_categoria pc ON pc.id_producto = p.id
-           WHERE p.id_negocio = s.id_negocio
-             AND pc.id_categoria = $1
-         )`,
-      ];
+      const filtros = ["sc.id_categoria = $1"];
       const valores = [idCategoria];
       let qLikeIndex = null;
 
@@ -227,13 +194,17 @@ function createCompradorRouter({ pool }) {
            s.nombre,
            s.calificacion,
            s.precio_base AS precio,
+           si.url_imagen AS imagen_principal,
            COALESCE(n.nombre_comercial, '') AS empresa,
            COUNT(r.id) AS numero_resenas
          FROM servicios s
+         INNER JOIN servicio_categoria sc ON sc.id_servicio = s.id
          INNER JOIN negocios n ON n.id = s.id_negocio
+         LEFT JOIN servicio_imagenes si ON si.id_servicio = s.id AND si.es_principal = TRUE
          LEFT JOIN resenas r ON r.id_servicio = s.id
-         WHERE ${filtros.join(" AND ")}
-         GROUP BY s.id, s.nombre, s.calificacion, s.precio_base, n.nombre_comercial, s.fecha_registro
+         WHERE s.esta_activo = TRUE
+           AND ${filtros.join(" AND ")}
+         GROUP BY s.id, s.nombre, s.calificacion, s.precio_base, si.url_imagen, n.nombre_comercial, s.fecha_registro
          ORDER BY ${orderBy}`,
         valores
       );
@@ -274,15 +245,9 @@ function createCompradorRouter({ pool }) {
            p.precio,
            p.sku,
            p.fecha_registro,
+           p.stock_total,
+           img.url_imagen AS imagen_principal,
            COALESCE(n.nombre_comercial, '') AS empresa,
-           COALESCE(
-             (
-               SELECT SUM(si.stock_total)
-               FROM sucursal_inventario si
-               WHERE si.id_producto = p.id
-             ),
-             0
-           ) AS stock_total,
            COALESCE(
              (
                SELECT COUNT(*)
@@ -302,7 +267,9 @@ function createCompradorRouter({ pool }) {
            ) AS categorias
          FROM productos p
          LEFT JOIN negocios n ON n.id = p.id_negocio
+         LEFT JOIN producto_imagenes img ON img.id_producto = p.id AND img.es_principal = TRUE
          WHERE p.id = $1
+           AND p.esta_activo = TRUE
          LIMIT 1`,
         [idProducto]
       );
@@ -338,6 +305,7 @@ function createCompradorRouter({ pool }) {
           precio: Number(producto.precio),
           sku: producto.sku,
           fecha_registro: producto.fecha_registro,
+          imagen_principal: producto.imagen_principal,
           empresa: producto.empresa,
           stock_total: Number(producto.stock_total),
           numero_resenas: Number(producto.numero_resenas),
@@ -379,6 +347,7 @@ function createCompradorRouter({ pool }) {
            s.precio_base,
            s.duracion_minutos,
            s.fecha_registro,
+           img.url_imagen AS imagen_principal,
            COALESCE(n.nombre_comercial, '') AS empresa,
            COALESCE(
              (
@@ -390,7 +359,9 @@ function createCompradorRouter({ pool }) {
            ) AS numero_resenas
          FROM servicios s
          LEFT JOIN negocios n ON n.id = s.id_negocio
+         LEFT JOIN servicio_imagenes img ON img.id_servicio = s.id AND img.es_principal = TRUE
          WHERE s.id = $1
+           AND s.esta_activo = TRUE
          LIMIT 1`,
         [idServicio]
       );
@@ -402,19 +373,19 @@ function createCompradorRouter({ pool }) {
       const agendaResult = await pool.query(
         `SELECT
            ag.id,
-           ag.id_sucursal,
            ag.fecha_hora_inicio,
            ag.fecha_hora_fin,
            ag.estado,
-           su.nombre_sucursal,
+           n.nombre_comercial,
            d.calle,
            d.ciudad,
            d.estado AS estado_direccion,
            d.codigo_postal,
            d.pais
          FROM agenda_servicios ag
-         LEFT JOIN sucursales su ON su.id = ag.id_sucursal
-         LEFT JOIN direcciones d ON d.id = su.id_direccion
+         INNER JOIN servicios s ON s.id = ag.id_servicio
+         LEFT JOIN negocios n ON n.id = s.id_negocio
+         LEFT JOIN direcciones d ON d.id = n.id_direccion
          WHERE ag.id_servicio = $1
            AND ag.estado = 'disponible'
          ORDER BY ag.fecha_hora_inicio ASC`,
@@ -437,6 +408,15 @@ function createCompradorRouter({ pool }) {
         [idServicio]
       );
 
+      const categoriasResult = await pool.query(
+        `SELECT c.nombre_categoria
+         FROM servicio_categoria sc
+         INNER JOIN categorias c ON c.id = sc.id_categoria
+         WHERE sc.id_servicio = $1
+         ORDER BY c.nombre_categoria ASC`,
+        [idServicio]
+      );
+
       const servicio = servicioResult.rows[0];
 
       return res.status(200).json({
@@ -448,16 +428,18 @@ function createCompradorRouter({ pool }) {
           precio: Number(servicio.precio_base),
           duracion_minutos: servicio.duracion_minutos,
           fecha_registro: servicio.fecha_registro,
+          imagen_principal: servicio.imagen_principal,
           empresa: servicio.empresa,
           numero_resenas: Number(servicio.numero_resenas),
+          categorias: categoriasResult.rows.map((categoria) => categoria.nombre_categoria),
           agenda_disponible: agendaResult.rows.map((slot) => ({
             id: slot.id,
-            id_sucursal: slot.id_sucursal,
+            id_sucursal: null,
             fecha_hora_inicio: slot.fecha_hora_inicio,
             fecha_hora_fin: slot.fecha_hora_fin,
             estado: slot.estado,
             sucursal: {
-              nombre: slot.nombre_sucursal,
+              nombre: slot.nombre_comercial,
               direccion: {
                 calle: slot.calle,
                 ciudad: slot.ciudad,

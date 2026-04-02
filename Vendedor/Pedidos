@@ -1,0 +1,220 @@
+const express = require("express");
+
+function createVendedorOrdersRouter({ pool }) {
+	const router = express.Router();
+
+	const requireAuth = (req, res, next) => {
+		const usuarioId = Number(req.session?.usuario_id || 0);
+		if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+			return res.status(401).json({ mensaje: "No autorizado" });
+		}
+		return next();
+	};
+
+	const getNegocioId = async (req, res) => {
+		const usuarioId = Number(req.session?.usuario_id || 0);
+		if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+			res.status(401).json({ mensaje: "No autorizado" });
+			return null;
+		}
+
+		const negocio = await pool.query(
+			`SELECT id
+			 FROM negocios
+			 WHERE id_usuario = $1
+			 LIMIT 1`,
+			[usuarioId]
+		);
+
+		if (negocio.rows.length === 0) {
+			res.status(404).json({ mensaje: "Negocio no encontrado" });
+			return null;
+		}
+
+		return negocio.rows[0].id;
+	};
+
+	router.get("/api/vendedor/pedidos", requireAuth, async (req, res) => {
+		try {
+			const negocioId = await getNegocioId(req, res);
+			if (negocioId === null) return;
+
+			const resultado = await pool.query(
+				`SELECT
+					p.id AS pedido_id,
+					p.fecha_pedido,
+					p.total,
+					p.estado_pedido,
+					p.direccion_envio_snapshot,
+					u.nombre AS comprador_nombre,
+					u.email AS comprador_email,
+					u.telefono AS comprador_telefono,
+					dp.id AS detalle_id,
+					dp.id_producto,
+					dp.id_servicio,
+					dp.cantidad,
+					dp.precio_unitario_historico,
+					dp.snapshot_item,
+					prod.nombre AS producto_nombre,
+					srv.nombre AS servicio_nombre
+				FROM pedidos p
+				JOIN detalle_pedido dp ON p.id = dp.id_pedido
+				LEFT JOIN productos prod ON dp.id_producto = prod.id
+				LEFT JOIN servicios srv ON dp.id_servicio = srv.id
+				JOIN usuarios u ON p.id_usuario = u.id
+				WHERE (prod.id_negocio = $1 OR srv.id_negocio = $1)
+				ORDER BY p.fecha_pedido DESC, dp.id ASC`,
+				[negocioId]
+			);
+
+			const pedidosMap = new Map();
+
+			for (const row of resultado.rows) {
+				if (!pedidosMap.has(row.pedido_id)) {
+					pedidosMap.set(row.pedido_id, {
+						id: row.pedido_id,
+						folio: `ORD-${row.pedido_id}`,
+						date: row.fecha_pedido,
+						buyerName: row.comprador_nombre,
+						buyerEmail: row.comprador_email,
+						buyerPhone: row.comprador_telefono,
+						total: parseFloat(row.total),
+						status: row.estado_pedido,
+						address: row.direccion_envio_snapshot,
+						items: [],
+					});
+				}
+
+				const esProducto = row.id_producto !== null;
+				const nameFromSnapshot = row.snapshot_item?.nombre || null;
+
+				pedidosMap.get(row.pedido_id).items.push({
+					id: esProducto ? row.id_producto : row.id_servicio,
+					type: esProducto ? "producto" : "servicio",
+					name: nameFromSnapshot || row.producto_nombre || row.servicio_nombre,
+					quantity: Number(row.cantidad),
+					price: parseFloat(row.precio_unitario_historico),
+					subtotal: parseFloat(row.precio_unitario_historico) * Number(row.cantidad),
+					snapshot: row.snapshot_item,
+				});
+			}
+
+			return res.json({
+				status: "success",
+				pedidos: Array.from(pedidosMap.values()),
+			});
+		} catch (error) {
+			console.error("Error al obtener pedidos:", error);
+			return res.status(500).json({ status: "error", mensaje: "Error al obtener los pedidos" });
+		}
+	});
+
+	router.put("/api/vendedor/pedidos/:pedidoId/estado", requireAuth, async (req, res) => {
+		try {
+			const pedidoId = Number(req.params.pedidoId);
+			const estado = String(req.body?.estado || "").trim();
+
+			if (!Number.isInteger(pedidoId) || pedidoId <= 0) {
+				return res.status(400).json({ status: "error", mensaje: "pedidoId invalido" });
+			}
+
+			const estadosPermitidos = ["PENDIENTE", "EN PREPARACION", "ENVIADO", "ENTREGADO", "CANCELADO"];
+			const estadoNormalizado = estado.toUpperCase();
+
+			if (!estadosPermitidos.includes(estadoNormalizado)) {
+				return res.status(400).json({ status: "error", mensaje: "Estado no valido" });
+			}
+
+			const negocioId = await getNegocioId(req, res);
+			if (negocioId === null) return;
+
+			const verification = await pool.query(
+				`SELECT p.id
+				 FROM pedidos p
+				 JOIN detalle_pedido dp ON p.id = dp.id_pedido
+				 LEFT JOIN productos prod ON dp.id_producto = prod.id
+				 LEFT JOIN servicios srv ON dp.id_servicio = srv.id
+				 WHERE p.id = $1
+					 AND (prod.id_negocio = $2 OR srv.id_negocio = $2)
+				 LIMIT 1`,
+				[pedidoId, negocioId]
+			);
+
+			if (verification.rows.length === 0) {
+				return res.status(403).json({
+					status: "error",
+					mensaje: "No tienes permiso para modificar este pedido",
+				});
+			}
+
+			await pool.query(
+				`UPDATE pedidos
+				 SET estado_pedido = $1
+				 WHERE id = $2`,
+				[estadoNormalizado, pedidoId]
+			);
+
+			return res.json({ status: "success", mensaje: "Estado del pedido actualizado correctamente" });
+		} catch (error) {
+			console.error("Error al actualizar estado del pedido:", error);
+			return res.status(500).json({ status: "error", mensaje: "Error al actualizar el estado del pedido" });
+		}
+	});
+
+	router.get("/api/vendedor/pedidos/estadisticas", requireAuth, async (req, res) => {
+		try {
+			const negocioId = await getNegocioId(req, res);
+			if (negocioId === null) return;
+
+			const statsByStatus = await pool.query(
+				`SELECT
+					p.estado_pedido,
+					COUNT(DISTINCT p.id) AS cantidad,
+					SUM(dp.cantidad * dp.precio_unitario_historico) AS total_ventas
+				FROM pedidos p
+				JOIN detalle_pedido dp ON p.id = dp.id_pedido
+				LEFT JOIN productos prod ON dp.id_producto = prod.id
+				LEFT JOIN servicios srv ON dp.id_servicio = srv.id
+				WHERE (prod.id_negocio = $1 OR srv.id_negocio = $1)
+				GROUP BY p.estado_pedido`,
+				[negocioId]
+			);
+
+			const monthlySales = await pool.query(
+				`SELECT
+					DATE_TRUNC('month', p.fecha_pedido) AS mes,
+					COUNT(DISTINCT p.id) AS cantidad_pedidos,
+					SUM(dp.cantidad * dp.precio_unitario_historico) AS total_ventas
+				FROM pedidos p
+				JOIN detalle_pedido dp ON p.id = dp.id_pedido
+				LEFT JOIN productos prod ON dp.id_producto = prod.id
+				LEFT JOIN servicios srv ON dp.id_servicio = srv.id
+				WHERE (prod.id_negocio = $1 OR srv.id_negocio = $1)
+					AND p.fecha_pedido >= NOW() - INTERVAL '6 months'
+				GROUP BY DATE_TRUNC('month', p.fecha_pedido)
+				ORDER BY mes DESC`,
+				[negocioId]
+			);
+
+			return res.json({
+				status: "success",
+				estadisticas: {
+					por_estado: statsByStatus.rows,
+					ventas_mensuales: monthlySales.rows,
+					total_pedidos: statsByStatus.rows.reduce((sum, row) => sum + parseInt(row.cantidad, 10), 0),
+					total_ventas: statsByStatus.rows.reduce(
+						(sum, row) => sum + parseFloat(row.total_ventas || 0),
+						0
+					),
+				},
+			});
+		} catch (error) {
+			console.error("Error al obtener estadísticas:", error);
+			return res.status(500).json({ status: "error", mensaje: "Error al obtener estadísticas" });
+		}
+	});
+
+	return router;
+}
+
+module.exports = createVendedorOrdersRouter;

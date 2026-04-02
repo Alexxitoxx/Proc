@@ -6,7 +6,8 @@ const { Pool } = require("pg");
 const fs = require("fs");
 const createLoginRouter = require("./Login/APIs");
 const createAdminRouter = require("./Admin/routes");
-const createVendedorRouter = require("./Vendedor/routes");
+const createVendedorRouter = require("./Vendedor/CRUD");
+const createVendedorOrdersRouter = require("./Vendedor/Pedidos");
 const createCompradorRouter = require("./Comprador/productos");
 const createCompradorCuentaRouter = require("./Comprador/cuenta");
 const createCompradorCarritoRouter = require("./Comprador/carrito");
@@ -106,6 +107,12 @@ app.use(
     pool,
     obtenerProductos,
     obtenerCategorias,
+  })
+);
+
+app.use(
+  createVendedorOrdersRouter({
+    pool,
   })
 );
 

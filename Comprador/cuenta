@@ -21,9 +21,35 @@ function createCompradorCuentaRouter({ pool }) {
 		return idUsuario;
 	}
 
+	async function requireActiveSession(req, res) {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return null;
+
+		try {
+			const usuarioActivo = await pool.query(
+				`SELECT id
+				 FROM usuarios
+				 WHERE id = $1
+				   AND activo = TRUE
+				   AND fecha_eliminacion IS NULL
+				 LIMIT 1`,
+				[idUsuario]
+			);
+
+			if (usuarioActivo.rows.length === 0) {
+				return res.status(401).json({ mensaje: "Sesion invalida o usuario inactivo" });
+			}
+
+			return idUsuario;
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al validar sesion" });
+		}
+	}
+
 	// Obtener informacion del usuario autenticado
 	router.get("/comprador/cuenta", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		try {
@@ -37,6 +63,8 @@ function createCompradorCuentaRouter({ pool }) {
 				 FROM usuarios u
 				 LEFT JOIN roles r ON r.id = u.id_rol
 				 WHERE u.id = $1
+				   AND u.activo = TRUE
+				   AND u.fecha_eliminacion IS NULL
 				 LIMIT 1`,
 				[idUsuario]
 			);
@@ -61,7 +89,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Actualizar informacion del usuario autenticado
 	router.put("/comprador/cuenta", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const { nombre, email, telefono } = req.body;
@@ -86,6 +114,8 @@ function createCompradorCuentaRouter({ pool }) {
 				     email = LOWER($2),
 				     telefono = $3
 				 WHERE id = $4
+				   AND activo = TRUE
+				   AND fecha_eliminacion IS NULL
 				 RETURNING id, nombre, email, telefono`,
 				[
 					String(nombre).trim(),
@@ -94,6 +124,10 @@ function createCompradorCuentaRouter({ pool }) {
 					idUsuario,
 				]
 			);
+
+			if (updated.rows.length === 0) {
+				return res.status(404).json({ mensaje: "Usuario no encontrado o inactivo" });
+			}
 
 			return res.status(200).json({
 				mensaje: "Informacion actualizada",
@@ -107,7 +141,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Agregar direccion del usuario autenticado
 	router.post("/comprador/cuenta/direcciones", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const {
@@ -191,7 +225,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Consultar direcciones del usuario autenticado
 	router.get("/comprador/cuenta/direcciones", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		try {
@@ -223,7 +257,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Eliminar direccion del usuario autenticado
 	router.delete("/comprador/cuenta/direcciones/:idDireccion", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const idDireccion = Number(req.params.idDireccion);
@@ -295,7 +329,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Agregar metodo de pago del usuario autenticado
 	router.post("/comprador/cuenta/metodos-pago", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const { proveedor_pago, token_pasarela, ultimos_cuatro, fecha_expiracion } = req.body;
@@ -346,7 +380,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Consultar metodos de pago del usuario autenticado
 	router.get("/comprador/cuenta/metodos-pago", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		try {
@@ -371,7 +405,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Eliminar metodo de pago del usuario autenticado
 	router.delete("/comprador/cuenta/metodos-pago/:idMetodoPago", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const idMetodoPago = Number(req.params.idMetodoPago);
@@ -400,7 +434,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Actualizar contrasena del usuario autenticado
 	router.put("/comprador/cuenta/contrasena", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const { password_actual, password_nueva } = req.body;
@@ -415,7 +449,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 		try {
 			const usuario = await pool.query(
-				"SELECT password_hash FROM usuarios WHERE id = $1 AND activo = TRUE LIMIT 1",
+				"SELECT password_hash FROM usuarios WHERE id = $1 AND activo = TRUE AND fecha_eliminacion IS NULL LIMIT 1",
 				[idUsuario]
 			);
 
@@ -446,7 +480,7 @@ function createCompradorCuentaRouter({ pool }) {
 
 	// Eliminar (desactivar) cuenta del usuario autenticado
 	router.delete("/comprador/cuenta", async (req, res) => {
-		const idUsuario = requireSession(req, res);
+		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
 		const { password_actual } = req.body;
