@@ -11,6 +11,7 @@ const createVendedorOrdersRouter = require("./Vendedor/Pedidos");
 const createCompradorRouter = require("./Comprador/productos");
 const createCompradorCuentaRouter = require("./Comprador/cuenta");
 const createCompradorCarritoRouter = require("./Comprador/carrito");
+const createCompradorPedidosRouter = require("./Comprador/pedidos");
 
 
 const app = express();
@@ -98,6 +99,12 @@ app.use(
 
 app.use(
   createCompradorCarritoRouter({
+    pool,
+  })
+);
+
+app.use(
+  createCompradorPedidosRouter({
     pool,
   })
 );

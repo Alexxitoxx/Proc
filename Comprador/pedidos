@@ -1,0 +1,376 @@
+const express = require("express");
+
+function createCompradorPedidosRouter({ pool }) {
+	const router = express.Router();
+
+	function obtenerUsuarioSesion(req) {
+		return Number(req.session?.usuario_id || 0);
+	}
+
+	function requireSession(req, res) {
+		const idUsuario = obtenerUsuarioSesion(req);
+		if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
+			res.status(401).json({ status: "error", mensaje: "Debes iniciar sesion" });
+			return null;
+		}
+		return idUsuario;
+	}
+
+	async function requireActiveSession(req, res) {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return null;
+
+		try {
+			const usuarioActivo = await pool.query(
+				`SELECT id
+				 FROM usuarios
+				 WHERE id = $1
+				   AND activo = TRUE
+				   AND fecha_eliminacion IS NULL
+				 LIMIT 1`,
+				[idUsuario]
+			);
+
+			if (usuarioActivo.rows.length === 0) {
+				res.status(401).json({ status: "error", mensaje: "Sesion invalida o usuario inactivo" });
+				return null;
+			}
+
+			return idUsuario;
+		} catch (error) {
+			console.error(error);
+			res.status(500).json({ status: "error", mensaje: "Error al validar sesion" });
+			return null;
+		}
+	}
+
+	router.get("/comprador/mis-pedidos", async (req, res) => {
+		try {
+			const idUsuario = await requireActiveSession(req, res);
+			if (!idUsuario) return;
+
+			const resultado = await pool.query(
+				`SELECT
+					p.id AS pedido_id,
+					p.fecha_pedido,
+					p.total,
+					p.estado_pedido,
+					p.direccion_envio_snapshot,
+					p.metodo_pago_snapshot,
+					dp.id AS detalle_id,
+					dp.cantidad,
+					dp.precio_unitario_historico,
+					dp.snapshot_item,
+					dp.id_producto,
+					dp.id_servicio,
+					prod.nombre AS producto_nombre,
+					srv.nombre AS servicio_nombre
+				 FROM pedidos p
+				 INNER JOIN detalle_pedido dp ON p.id = dp.id_pedido
+				 LEFT JOIN productos prod ON dp.id_producto = prod.id
+				 LEFT JOIN servicios srv ON dp.id_servicio = srv.id
+				 WHERE p.id_usuario = $1
+				 ORDER BY p.fecha_pedido DESC, dp.id ASC`,
+				[idUsuario]
+			);
+
+			const pedidosMap = new Map();
+
+			for (const row of resultado.rows) {
+				if (!pedidosMap.has(row.pedido_id)) {
+					pedidosMap.set(row.pedido_id, {
+						id: row.pedido_id,
+						folio: `ORD-${row.pedido_id}`,
+						fecha: row.fecha_pedido,
+						total: Number(row.total),
+						estado: row.estado_pedido,
+						direccion: row.direccion_envio_snapshot,
+						metodo_pago: row.metodo_pago_snapshot,
+						items: [],
+					});
+				}
+
+				const esProducto = row.id_producto !== null;
+				const nombreSnapshot = row.snapshot_item?.nombre || null;
+
+				pedidosMap.get(row.pedido_id).items.push({
+					id: esProducto ? row.id_producto : row.id_servicio,
+					tipo: esProducto ? "producto" : "servicio",
+					nombre: nombreSnapshot || row.producto_nombre || row.servicio_nombre || "Item no disponible",
+					cantidad: Number(row.cantidad),
+					precio: Number(row.precio_unitario_historico),
+					subtotal: Number(row.cantidad) * Number(row.precio_unitario_historico),
+					imagen: row.snapshot_item?.imagen_principal || null,
+					snapshot: row.snapshot_item,
+				});
+			}
+
+			return res.status(200).json({
+				status: "success",
+				total: pedidosMap.size,
+				pedidos: Array.from(pedidosMap.values()),
+			});
+		} catch (error) {
+			console.error("Error al obtener pedidos del comprador:", error);
+			return res.status(500).json({ status: "error", mensaje: "Error al obtener el historial de pedidos" });
+		}
+	});
+
+	router.get("/comprador/mis-pedidos/:pedidoId", async (req, res) => {
+		try {
+			const idUsuario = await requireActiveSession(req, res);
+			if (!idUsuario) return;
+
+			const pedidoId = Number(req.params.pedidoId);
+			if (!Number.isInteger(pedidoId) || pedidoId <= 0) {
+				return res.status(400).json({ status: "error", mensaje: "pedidoId invalido" });
+			}
+
+			const pedidoResult = await pool.query(
+				`SELECT
+					id,
+					fecha_pedido,
+					total,
+					estado_pedido,
+					direccion_envio_snapshot,
+					metodo_pago_snapshot
+				 FROM pedidos
+				 WHERE id = $1
+				   AND id_usuario = $2
+				 LIMIT 1`,
+				[pedidoId, idUsuario]
+			);
+
+			if (pedidoResult.rows.length === 0) {
+				return res.status(404).json({ status: "error", mensaje: "Pedido no encontrado" });
+			}
+
+			const itemsResult = await pool.query(
+				`SELECT
+					dp.id,
+					dp.cantidad,
+					dp.precio_unitario_historico,
+					dp.snapshot_item,
+					dp.id_producto,
+					dp.id_servicio,
+					dp.id_agenda_seleccionada,
+					ag.fecha_hora_inicio,
+					ag.fecha_hora_fin,
+					ag.estado AS agenda_estado,
+					prod.nombre AS producto_nombre,
+					srv.nombre AS servicio_nombre
+				 FROM detalle_pedido dp
+				 LEFT JOIN agenda_servicios ag ON dp.id_agenda_seleccionada = ag.id
+				 LEFT JOIN productos prod ON dp.id_producto = prod.id
+				 LEFT JOIN servicios srv ON dp.id_servicio = srv.id
+				 WHERE dp.id_pedido = $1
+				 ORDER BY dp.id ASC`,
+				[pedidoId]
+			);
+
+			const pedido = pedidoResult.rows[0];
+
+			return res.status(200).json({
+				status: "success",
+				pedido: {
+					id: pedido.id,
+					folio: `ORD-${pedido.id}`,
+					fecha: pedido.fecha_pedido,
+					total: Number(pedido.total),
+					estado: pedido.estado_pedido,
+					direccion: pedido.direccion_envio_snapshot,
+					metodo_pago: pedido.metodo_pago_snapshot,
+					items: itemsResult.rows.map((item) => ({
+						id: item.id,
+						producto_id: item.id_producto,
+						servicio_id: item.id_servicio,
+						tipo: item.id_producto ? "producto" : "servicio",
+						nombre:
+							item.snapshot_item?.nombre ||
+							item.producto_nombre ||
+							item.servicio_nombre ||
+							"Item no disponible",
+						cantidad: Number(item.cantidad),
+						precio: Number(item.precio_unitario_historico),
+						subtotal: Number(item.cantidad) * Number(item.precio_unitario_historico),
+						imagen: item.snapshot_item?.imagen_principal || null,
+						snapshot: item.snapshot_item,
+						agenda: item.id_agenda_seleccionada
+							? {
+								id_agenda: item.id_agenda_seleccionada,
+								fecha_inicio: item.fecha_hora_inicio,
+								fecha_fin: item.fecha_hora_fin,
+								estado: item.agenda_estado,
+							}
+							: null,
+					})),
+				},
+			});
+		} catch (error) {
+			console.error("Error al obtener detalle del pedido:", error);
+			return res.status(500).json({ status: "error", mensaje: "Error al obtener el detalle del pedido" });
+		}
+	});
+
+	router.put("/comprador/mis-pedidos/:pedidoId/cancelar", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		const pedidoId = Number(req.params.pedidoId);
+		if (!Number.isInteger(pedidoId) || pedidoId <= 0) {
+			return res.status(400).json({ status: "error", mensaje: "pedidoId invalido" });
+		}
+
+		const pedido = await pool.query(
+			`SELECT estado_pedido
+			 FROM pedidos
+			 WHERE id = $1
+			   AND id_usuario = $2
+			 LIMIT 1`,
+			[pedidoId, idUsuario]
+		);
+
+		if (pedido.rows.length === 0) {
+			return res.status(404).json({ status: "error", mensaje: "Pedido no encontrado" });
+		}
+
+		const estadoActual = String(pedido.rows[0].estado_pedido || "").toUpperCase();
+		if (estadoActual !== "PENDIENTE" && estadoActual !== "EN PREPARACION") {
+			return res.status(400).json({
+				status: "error",
+				mensaje: "Solo se pueden cancelar pedidos en estado PENDIENTE o EN PREPARACION",
+			});
+		}
+
+		const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+
+			const items = await client.query(
+				`SELECT id_producto, cantidad
+				 FROM detalle_pedido
+				 WHERE id_pedido = $1
+				   AND id_producto IS NOT NULL`,
+				[pedidoId]
+			);
+
+			for (const item of items.rows) {
+				const lote = await client.query(
+					`SELECT id
+					 FROM lotes_inventario
+					 WHERE id_producto = $1
+					   AND fecha_caducidad >= CURRENT_DATE
+					 ORDER BY fecha_caducidad DESC
+					 LIMIT 1`,
+					[item.id_producto]
+				);
+
+				if (lote.rows.length > 0) {
+					await client.query(
+						`UPDATE lotes_inventario
+						 SET stock_disponible = stock_disponible + $1
+						 WHERE id = $2`,
+						[item.cantidad, lote.rows[0].id]
+					);
+				} else {
+					await client.query(
+						`INSERT INTO lotes_inventario (id_producto, stock_disponible, fecha_recibido, fecha_caducidad)
+						 VALUES ($1, $2, CURRENT_DATE, CURRENT_DATE + INTERVAL '1 year')`,
+						[item.id_producto, item.cantidad]
+					);
+				}
+			}
+
+			await client.query(
+				`UPDATE pedidos
+				 SET estado_pedido = 'CANCELADO'
+				 WHERE id = $1`,
+				[pedidoId]
+			);
+
+			await client.query("COMMIT");
+			return res.status(200).json({ status: "success", mensaje: "Pedido cancelado exitosamente" });
+		} catch (error) {
+			await client.query("ROLLBACK");
+			console.error("Error al cancelar pedido:", error);
+			return res.status(500).json({ status: "error", mensaje: "Error al cancelar el pedido" });
+		} finally {
+			client.release();
+		}
+	});
+
+	router.get("/comprador/mi-resumen-compras", async (req, res) => {
+		try {
+			const idUsuario = await requireActiveSession(req, res);
+			if (!idUsuario) return;
+
+			const stats = await pool.query(
+				`SELECT
+					COUNT(*) AS total_pedidos,
+					SUM(total) AS total_gastado,
+					AVG(total) AS promedio_compra,
+					COUNT(CASE WHEN estado_pedido = 'ENTREGADO' THEN 1 END) AS pedidos_entregados,
+					COUNT(CASE WHEN estado_pedido = 'CANCELADO' THEN 1 END) AS pedidos_cancelados
+				 FROM pedidos
+				 WHERE id_usuario = $1`,
+				[idUsuario]
+			);
+
+			const productosTop = await pool.query(
+				`SELECT
+					COALESCE(dp.snapshot_item->>'nombre', 'Item sin nombre') AS nombre,
+					COUNT(*) AS veces_comprado,
+					SUM(dp.cantidad) AS total_unidades
+				 FROM detalle_pedido dp
+				 INNER JOIN pedidos p ON dp.id_pedido = p.id
+				 WHERE p.id_usuario = $1
+				   AND dp.id_producto IS NOT NULL
+				 GROUP BY COALESCE(dp.snapshot_item->>'nombre', 'Item sin nombre')
+				 ORDER BY veces_comprado DESC
+				 LIMIT 5`,
+				[idUsuario]
+			);
+
+			const comprasPorMes = await pool.query(
+				`SELECT
+					DATE_TRUNC('month', fecha_pedido) AS mes,
+					COUNT(*) AS cantidad_pedidos,
+					SUM(total) AS total_mes
+				 FROM pedidos
+				 WHERE id_usuario = $1
+				   AND fecha_pedido >= NOW() - INTERVAL '12 months'
+				 GROUP BY DATE_TRUNC('month', fecha_pedido)
+				 ORDER BY mes DESC`,
+				[idUsuario]
+			);
+
+			return res.status(200).json({
+				status: "success",
+				resumen: {
+					total_pedidos: Number.parseInt(stats.rows[0].total_pedidos, 10) || 0,
+					total_gastado: Number.parseFloat(stats.rows[0].total_gastado) || 0,
+					promedio_compra: Number.parseFloat(stats.rows[0].promedio_compra) || 0,
+					pedidos_entregados: Number.parseInt(stats.rows[0].pedidos_entregados, 10) || 0,
+					pedidos_cancelados: Number.parseInt(stats.rows[0].pedidos_cancelados, 10) || 0,
+					productos_mas_comprados: productosTop.rows.map((row) => ({
+						nombre: row.nombre,
+						veces_comprado: Number.parseInt(row.veces_comprado, 10),
+						total_unidades: Number.parseInt(row.total_unidades, 10),
+					})),
+					compras_por_mes: comprasPorMes.rows.map((row) => ({
+						mes: row.mes,
+						cantidad_pedidos: Number.parseInt(row.cantidad_pedidos, 10),
+						total: Number.parseFloat(row.total_mes),
+					})),
+				},
+			});
+		} catch (error) {
+			console.error("Error al obtener resumen de compras:", error);
+			return res.status(500).json({ status: "error", mensaje: "Error al obtener el resumen de compras" });
+		}
+	});
+
+	return router;
+}
+
+module.exports = createCompradorPedidosRouter;

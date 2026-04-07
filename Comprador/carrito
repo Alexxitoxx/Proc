@@ -558,7 +558,7 @@ function createCompradorCarritoRouter({ pool }) {
 			const idPedido = Number(checkoutResult.rows[0].id_pedido);
 
 			const pedidoResult = await client.query(
-				`SELECT id, total, estado_pedido, fecha_creacion
+				`SELECT id, total, estado_pedido, fecha_pedido
 				 FROM pedidos
 				 WHERE id = $1
 				 LIMIT 1`,
@@ -581,7 +581,7 @@ function createCompradorCarritoRouter({ pool }) {
 					id: pedido.id,
 					total: Number(pedido.total),
 					estado_pedido: pedido.estado_pedido,
-					fecha_creacion: pedido.fecha_creacion,
+					fecha_pedido: pedido.fecha_pedido,
 				},
 			});
 		} catch (error) {
