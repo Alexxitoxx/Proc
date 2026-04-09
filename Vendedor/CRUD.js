@@ -103,10 +103,17 @@ function createVendedorRouter({ pool }) {
 
     try {
       const result = await pool.query(
-        `SELECT id, id_negocio, nombre, descripcion, precio, stock_total, sku, esta_activo, fecha_registro
-         FROM productos
+        `SELECT p.id, p.id_negocio, p.nombre, p.descripcion, p.precio, p.stock_total, p.sku, p.esta_activo, p.fecha_registro,
+                (
+                  SELECT pi.url_imagen
+                  FROM producto_imagenes pi
+                  WHERE pi.id_producto = p.id
+                  ORDER BY pi.es_principal DESC, pi.orden_visual ASC, pi.id ASC
+                  LIMIT 1
+                ) AS imagen_principal
+         FROM productos p
          WHERE id_negocio = $1
-         ORDER BY id DESC`,
+         ORDER BY p.id DESC`,
         [idNegocio]
       );
 
@@ -119,42 +126,97 @@ function createVendedorRouter({ pool }) {
 
   // CREATE
   router.post("/api/vendedor/productos", async (req, res) => {
-    const { nombre, descripcion, precio, id_negocio, sku } = req.body;
+    const { nombre, descripcion, precio, id_negocio, sku, stock_total, imagenes } = req.body;
     const idNegocio = Number(id_negocio);
     const precioNum = Number(precio);
+    const stockTotalNum =
+      stock_total === undefined || stock_total === null || stock_total === "" ? 0 : Number(stock_total);
 
     if (!nombre || !Number.isFinite(precioNum) || !Number.isInteger(idNegocio) || idNegocio <= 0) {
       return res.status(400).json({ error: "Datos incompletos o invalidos" });
     }
 
+    if (!Number.isInteger(stockTotalNum) || stockTotalNum < 0) {
+      return res.status(400).json({ error: "stock_total invalido" });
+    }
+
+    if (imagenes !== undefined && !Array.isArray(imagenes)) {
+      return res.status(400).json({ error: "imagenes debe ser un arreglo de URLs" });
+    }
+
+    const imagenesNormalizadas =
+      imagenes === undefined
+        ? []
+        : [...new Set(imagenes.map((url) => String(url || "").trim()).filter((url) => url.length > 0))];
+
+    const client = await pool.connect();
     try {
-      const negocio = await pool.query("SELECT id FROM negocios WHERE id = $1 LIMIT 1", [idNegocio]);
+      await client.query("BEGIN");
+
+      const negocio = await client.query("SELECT id FROM negocios WHERE id = $1 LIMIT 1", [idNegocio]);
       if (negocio.rows.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(404).json({ error: "Negocio no encontrado" });
       }
 
-      const result = await pool.query(
-        `INSERT INTO productos (nombre, descripcion, precio, id_negocio, sku)
-         VALUES ($1,$2,$3,$4,$5)
+      const result = await client.query(
+        `INSERT INTO productos (nombre, descripcion, precio, id_negocio, sku, stock_total)
+         VALUES ($1,$2,$3,$4,$5,$6)
          RETURNING id, id_negocio, nombre, descripcion, precio, stock_total, sku, esta_activo, fecha_registro`,
-        [String(nombre).trim(), descripcion ? String(descripcion).trim() : null, precioNum, idNegocio, sku || null]
+        [
+          String(nombre).trim(),
+          descripcion ? String(descripcion).trim() : null,
+          precioNum,
+          idNegocio,
+          sku || null,
+          stockTotalNum,
+        ]
       );
 
-      return res.status(201).json(result.rows[0]);
+      const producto = result.rows[0];
+
+      if (imagenesNormalizadas.length > 0) {
+        await client.query(
+          `INSERT INTO producto_imagenes (id_producto, url_imagen, es_principal, orden_visual)
+           SELECT $1, data.url_imagen, data.ord = 1, data.ord - 1
+           FROM UNNEST($2::text[]) WITH ORDINALITY AS data(url_imagen, ord)`,
+          [producto.id, imagenesNormalizadas]
+        );
+      }
+
+      const imagenesGuardadas = await client.query(
+        `SELECT id, url_imagen, es_principal, orden_visual
+         FROM producto_imagenes
+         WHERE id_producto = $1
+         ORDER BY orden_visual ASC, id ASC`,
+        [producto.id]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(201).json({
+        ...producto,
+        imagenes: imagenesGuardadas.rows,
+      });
     } catch (err) {
+      await client.query("ROLLBACK");
       if (err.code === "23505") {
         return res.status(409).json({ error: "SKU duplicado" });
       }
 
       console.error(err);
       return res.status(500).json({ error: "Error al crear producto" });
+    } finally {
+      client.release();
     }
   });
 
   // UPDATE
   router.put("/api/vendedor/productos/:id", async (req, res) => {
     const idProducto = Number(req.params.id);
-    const { nombre, descripcion, precio, sku, esta_activo } = req.body;
+    const { nombre, descripcion, precio, sku, esta_activo, stock_total, imagenes } = req.body;
+    const stockTotalNum =
+      stock_total === undefined || stock_total === null || stock_total === "" ? null : Number(stock_total);
 
     if (!Number.isInteger(idProducto) || idProducto <= 0) {
       return res.status(400).json({ error: "id invalido" });
@@ -164,18 +226,35 @@ function createVendedorRouter({ pool }) {
       return res.status(400).json({ error: "Nombre y precio son obligatorios" });
     }
 
+    if (stockTotalNum !== null && (!Number.isInteger(stockTotalNum) || stockTotalNum < 0)) {
+      return res.status(400).json({ error: "stock_total invalido" });
+    }
+
+    if (imagenes !== undefined && !Array.isArray(imagenes)) {
+      return res.status(400).json({ error: "imagenes debe ser un arreglo de URLs" });
+    }
+
+    const imagenesNormalizadas =
+      imagenes === undefined
+        ? null
+        : [...new Set(imagenes.map((url) => String(url || "").trim()).filter((url) => url.length > 0))];
+
     const activo =
       esta_activo === undefined || esta_activo === null ? true : Boolean(esta_activo);
 
+    const client = await pool.connect();
     try {
-      const result = await pool.query(
+      await client.query("BEGIN");
+
+      const result = await client.query(
         `UPDATE productos
          SET nombre = $1,
              descripcion = $2,
              precio = $3,
              sku = $4,
-             esta_activo = $5
-         WHERE id = $6
+             esta_activo = $5,
+             stock_total = COALESCE($6, stock_total)
+         WHERE id = $7
          RETURNING id, id_negocio, nombre, descripcion, precio, stock_total, sku, esta_activo, fecha_registro`,
         [
           String(nombre).trim(),
@@ -183,22 +262,53 @@ function createVendedorRouter({ pool }) {
           Number(precio),
           sku || null,
           activo,
+          stockTotalNum,
           idProducto,
         ]
       );
 
       if (result.rows.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(404).json({ error: "Producto no encontrado" });
       }
 
-      return res.status(200).json(result.rows[0]);
+      if (imagenesNormalizadas !== null) {
+        await client.query("DELETE FROM producto_imagenes WHERE id_producto = $1", [idProducto]);
+
+        if (imagenesNormalizadas.length > 0) {
+          await client.query(
+            `INSERT INTO producto_imagenes (id_producto, url_imagen, es_principal, orden_visual)
+             SELECT $1, data.url_imagen, data.ord = 1, data.ord - 1
+             FROM UNNEST($2::text[]) WITH ORDINALITY AS data(url_imagen, ord)`,
+            [idProducto, imagenesNormalizadas]
+          );
+        }
+      }
+
+      const imagenesGuardadas = await client.query(
+        `SELECT id, url_imagen, es_principal, orden_visual
+         FROM producto_imagenes
+         WHERE id_producto = $1
+         ORDER BY orden_visual ASC, id ASC`,
+        [idProducto]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(200).json({
+        ...result.rows[0],
+        imagenes: imagenesGuardadas.rows,
+      });
     } catch (err) {
+      await client.query("ROLLBACK");
       if (err.code === "23505") {
         return res.status(409).json({ error: "SKU duplicado" });
       }
 
       console.error(err);
       return res.status(500).json({ error: "Error al actualizar producto" });
+    } finally {
+      client.release();
     }
   });
 
@@ -313,10 +423,17 @@ function createVendedorRouter({ pool }) {
 
     try {
       const result = await pool.query(
-        `SELECT id, id_negocio, nombre, descripcion, precio_base, duracion_minutos, calificacion, esta_activo, fecha_registro
-         FROM servicios
+        `SELECT s.id, s.id_negocio, s.nombre, s.descripcion, s.precio_base, s.duracion_minutos, s.calificacion, s.esta_activo, s.fecha_registro,
+                (
+                  SELECT si.url_imagen
+                  FROM servicio_imagenes si
+                  WHERE si.id_servicio = s.id
+                  ORDER BY si.es_principal DESC, si.orden_visual ASC, si.id ASC
+                  LIMIT 1
+                ) AS imagen_principal
+         FROM servicios s
          WHERE id_negocio = $1
-         ORDER BY id DESC`,
+         ORDER BY s.id DESC`,
         [idNegocio]
       );
 
@@ -329,7 +446,7 @@ function createVendedorRouter({ pool }) {
 
   // CREATE
   router.post("/api/vendedor/servicios", async (req, res) => {
-    const { nombre, descripcion, precio_base, duracion_minutos, id_negocio } = req.body;
+    const { nombre, descripcion, precio_base, duracion_minutos, id_negocio, imagenes } = req.body;
     const idNegocio = Number(id_negocio);
     const precioBaseNum = Number(precio_base);
     const duracionNum =
@@ -345,13 +462,26 @@ function createVendedorRouter({ pool }) {
       return res.status(400).json({ error: "duracion_minutos invalido" });
     }
 
+    if (imagenes !== undefined && !Array.isArray(imagenes)) {
+      return res.status(400).json({ error: "imagenes debe ser un arreglo de URLs" });
+    }
+
+    const imagenesNormalizadas =
+      imagenes === undefined
+        ? []
+        : [...new Set(imagenes.map((url) => String(url || "").trim()).filter((url) => url.length > 0))];
+
+    const client = await pool.connect();
     try {
-      const negocio = await pool.query("SELECT id FROM negocios WHERE id = $1 LIMIT 1", [idNegocio]);
+      await client.query("BEGIN");
+
+      const negocio = await client.query("SELECT id FROM negocios WHERE id = $1 LIMIT 1", [idNegocio]);
       if (negocio.rows.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(404).json({ error: "Negocio no encontrado" });
       }
 
-      const result = await pool.query(
+      const result = await client.query(
         `INSERT INTO servicios (nombre, descripcion, precio_base, duracion_minutos, id_negocio)
          VALUES ($1,$2,$3,$4,$5)
          RETURNING id, id_negocio, nombre, descripcion, precio_base, duracion_minutos, calificacion, esta_activo, fecha_registro`,
@@ -364,17 +494,44 @@ function createVendedorRouter({ pool }) {
         ]
       );
 
-      return res.status(201).json(result.rows[0]);
+      const servicio = result.rows[0];
+
+      if (imagenesNormalizadas.length > 0) {
+        await client.query(
+          `INSERT INTO servicio_imagenes (id_servicio, url_imagen, es_principal, orden_visual)
+           SELECT $1, data.url_imagen, data.ord = 1, data.ord - 1
+           FROM UNNEST($2::text[]) WITH ORDINALITY AS data(url_imagen, ord)`,
+          [servicio.id, imagenesNormalizadas]
+        );
+      }
+
+      const imagenesGuardadas = await client.query(
+        `SELECT id, url_imagen, es_principal, orden_visual
+         FROM servicio_imagenes
+         WHERE id_servicio = $1
+         ORDER BY orden_visual ASC, id ASC`,
+        [servicio.id]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(201).json({
+        ...servicio,
+        imagenes: imagenesGuardadas.rows,
+      });
     } catch (err) {
+      await client.query("ROLLBACK");
       console.error(err);
       return res.status(500).json({ error: "Error al crear servicio" });
+    } finally {
+      client.release();
     }
   });
 
   // UPDATE
   router.put("/api/vendedor/servicios/:id", async (req, res) => {
     const idServicio = Number(req.params.id);
-    const { nombre, descripcion, precio_base, duracion_minutos, esta_activo } = req.body;
+    const { nombre, descripcion, precio_base, duracion_minutos, esta_activo, imagenes } = req.body;
     const precioBaseNum = Number(precio_base);
     const duracionNum =
       duracion_minutos === undefined || duracion_minutos === null || duracion_minutos === ""
@@ -393,11 +550,23 @@ function createVendedorRouter({ pool }) {
       return res.status(400).json({ error: "duracion_minutos invalido" });
     }
 
+    if (imagenes !== undefined && !Array.isArray(imagenes)) {
+      return res.status(400).json({ error: "imagenes debe ser un arreglo de URLs" });
+    }
+
+    const imagenesNormalizadas =
+      imagenes === undefined
+        ? null
+        : [...new Set(imagenes.map((url) => String(url || "").trim()).filter((url) => url.length > 0))];
+
     const activo =
       esta_activo === undefined || esta_activo === null ? true : Boolean(esta_activo);
 
+    const client = await pool.connect();
     try {
-      const result = await pool.query(
+      await client.query("BEGIN");
+
+      const result = await client.query(
         `UPDATE servicios
          SET nombre = $1,
              descripcion = $2,
@@ -417,13 +586,43 @@ function createVendedorRouter({ pool }) {
       );
 
       if (result.rows.length === 0) {
+        await client.query("ROLLBACK");
         return res.status(404).json({ error: "Servicio no encontrado" });
       }
 
-      return res.status(200).json(result.rows[0]);
+      if (imagenesNormalizadas !== null) {
+        await client.query("DELETE FROM servicio_imagenes WHERE id_servicio = $1", [idServicio]);
+
+        if (imagenesNormalizadas.length > 0) {
+          await client.query(
+            `INSERT INTO servicio_imagenes (id_servicio, url_imagen, es_principal, orden_visual)
+             SELECT $1, data.url_imagen, data.ord = 1, data.ord - 1
+             FROM UNNEST($2::text[]) WITH ORDINALITY AS data(url_imagen, ord)`,
+            [idServicio, imagenesNormalizadas]
+          );
+        }
+      }
+
+      const imagenesGuardadas = await client.query(
+        `SELECT id, url_imagen, es_principal, orden_visual
+         FROM servicio_imagenes
+         WHERE id_servicio = $1
+         ORDER BY orden_visual ASC, id ASC`,
+        [idServicio]
+      );
+
+      await client.query("COMMIT");
+
+      return res.status(200).json({
+        ...result.rows[0],
+        imagenes: imagenesGuardadas.rows,
+      });
     } catch (err) {
+      await client.query("ROLLBACK");
       console.error(err);
       return res.status(500).json({ error: "Error al actualizar servicio" });
+    } finally {
+      client.release();
     }
   });
 

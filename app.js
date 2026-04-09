@@ -1,13 +1,11 @@
 const express = require("express");
 const session = require("express-session");
-const path = require("path");
-const multer = require("multer");
 const { Pool } = require("pg");
-const fs = require("fs");
 const createLoginRouter = require("./Login/APIs");
 const createAdminRouter = require("./Admin/routes");
 const createVendedorRouter = require("./Vendedor/CRUD");
 const createVendedorOrdersRouter = require("./Vendedor/Pedidos");
+const createVendedorBusinessRouter = require("./Vendedor/Negocio");
 const createCompradorRouter = require("./Comprador/productos");
 const createCompradorCuentaRouter = require("./Comprador/cuenta");
 const createCompradorCarritoRouter = require("./Comprador/carrito");
@@ -38,38 +36,6 @@ const pool = new Pool({
   port: 5432,
 });
 
-// Carpeta de imágenes
-const uploadFolder = "static/images/products";
-
-if (!fs.existsSync(uploadFolder)) {
-  fs.mkdirSync(uploadFolder, { recursive: true });
-}
-
-// Configuración de subida de imágenes
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadFolder);
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
-  },
-});
-
-const upload = multer({ storage });
-
-// Obtener productos
-async function obtenerProductos() {
-  const result = await pool.query("SELECT * FROM Productos");
-  return result.rows;
-}
-
-// Obtener categorías
-async function obtenerCategorias() {
-  const result = await pool.query(
-    "SELECT DISTINCT categoria FROM Productos"
-  );
-  return result.rows.map((c) => c.categoria);
-}
 
 app.use(
   createLoginRouter({
@@ -80,8 +46,6 @@ app.use(
 app.use(
   createAdminRouter({
     pool,
-    upload,
-    obtenerProductos,
   })
 );
 
@@ -112,13 +76,17 @@ app.use(
 app.use(
   createVendedorRouter({
     pool,
-    obtenerProductos,
-    obtenerCategorias,
   })
 );
 
 app.use(
   createVendedorOrdersRouter({
+    pool,
+  })
+);
+
+app.use(
+  createVendedorBusinessRouter({
     pool,
   })
 );

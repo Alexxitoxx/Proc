@@ -1,6 +1,6 @@
 const express = require("express");
 
-function createAdminRouter({ pool, upload, obtenerProductos }) {
+function createAdminRouter({ pool }) {
   const router = express.Router();
 
   function requireAdminSession(req, res) {
