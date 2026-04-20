@@ -44,7 +44,7 @@ function createCompradorPedidosRouter({ pool }) {
 		}
 	}
 
-	router.get("/comprador/mis-pedidos", async (req, res) => {
+	router.get("/:perfil(comprador|usuario)/mis-pedidos", async (req, res) => {
 		try {
 			const idUsuario = await requireActiveSession(req, res);
 			if (!idUsuario) return;
@@ -116,7 +116,7 @@ function createCompradorPedidosRouter({ pool }) {
 		}
 	});
 
-	router.get("/comprador/mis-pedidos/:pedidoId", async (req, res) => {
+	router.get("/:perfil(comprador|usuario)/mis-pedidos/:pedidoId", async (req, res) => {
 		try {
 			const idUsuario = await requireActiveSession(req, res);
 			if (!idUsuario) return;
@@ -212,7 +212,7 @@ function createCompradorPedidosRouter({ pool }) {
 		}
 	});
 
-	router.put("/comprador/mis-pedidos/:pedidoId/cancelar", async (req, res) => {
+	router.put("/:perfil(comprador|usuario)/mis-pedidos/:pedidoId/cancelar", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -221,30 +221,33 @@ function createCompradorPedidosRouter({ pool }) {
 			return res.status(400).json({ status: "error", mensaje: "pedidoId invalido" });
 		}
 
-		const pedido = await pool.query(
-			`SELECT estado_pedido
-			 FROM pedidos
-			 WHERE id = $1
-			   AND id_usuario = $2
-			 LIMIT 1`,
-			[pedidoId, idUsuario]
-		);
-
-		if (pedido.rows.length === 0) {
-			return res.status(404).json({ status: "error", mensaje: "Pedido no encontrado" });
-		}
-
-		const estadoActual = String(pedido.rows[0].estado_pedido || "").toUpperCase();
-		if (estadoActual !== "PENDIENTE" && estadoActual !== "EN PREPARACION") {
-			return res.status(400).json({
-				status: "error",
-				mensaje: "Solo se pueden cancelar pedidos en estado PENDIENTE o EN PREPARACION",
-			});
-		}
-
 		const client = await pool.connect();
 		try {
 			await client.query("BEGIN");
+
+			const pedido = await client.query(
+				`SELECT estado_pedido
+				 FROM pedidos
+				 WHERE id = $1
+				   AND id_usuario = $2
+				 LIMIT 1
+				 FOR UPDATE`,
+				[pedidoId, idUsuario]
+			);
+
+			if (pedido.rows.length === 0) {
+				await client.query("ROLLBACK");
+				return res.status(404).json({ status: "error", mensaje: "Pedido no encontrado" });
+			}
+
+			const estadoActual = String(pedido.rows[0].estado_pedido || "").toUpperCase();
+			if (estadoActual !== "PENDIENTE" && estadoActual !== "EN PREPARACION") {
+				await client.query("ROLLBACK");
+				return res.status(400).json({
+					status: "error",
+					mensaje: "Solo se pueden cancelar pedidos en estado PENDIENTE o EN PREPARACION",
+				});
+			}
 
 			const items = await client.query(
 				`SELECT id_producto, cantidad
@@ -281,6 +284,20 @@ function createCompradorPedidosRouter({ pool }) {
 				}
 			}
 
+			// Libera las agendas reservadas por servicios al cancelar el pedido.
+			await client.query(
+				`UPDATE agenda_servicios ag
+				 SET estado = 'disponible',
+				     id_usuario_cliente = NULL
+				 WHERE ag.id IN (
+					 SELECT dp.id_agenda_seleccionada
+					 FROM detalle_pedido dp
+					 WHERE dp.id_pedido = $1
+					   AND dp.id_agenda_seleccionada IS NOT NULL
+				 )`,
+				[pedidoId]
+			);
+
 			await client.query(
 				`UPDATE pedidos
 				 SET estado_pedido = 'CANCELADO'
@@ -299,7 +316,7 @@ function createCompradorPedidosRouter({ pool }) {
 		}
 	});
 
-	router.get("/comprador/mi-resumen-compras", async (req, res) => {
+	router.get("/:perfil(comprador|usuario)/mi-resumen-compras", async (req, res) => {
 		try {
 			const idUsuario = await requireActiveSession(req, res);
 			if (!idUsuario) return;

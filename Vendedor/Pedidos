@@ -3,18 +3,48 @@ const express = require("express");
 function createVendedorOrdersRouter({ pool }) {
 	const router = express.Router();
 
-	const requireAuth = (req, res, next) => {
+	// Valida sesion de vendedor activa y deja el id de usuario en req para reutilizarlo.
+	const requireVendedorAuth = async (req, res, next) => {
 		const usuarioId = Number(req.session?.usuario_id || 0);
+		const rol = String(req.session?.rol || "").toLowerCase();
+
 		if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
-			return res.status(401).json({ mensaje: "No autorizado" });
+			return res.status(401).json({ status: "error", mensaje: "No autorizado" });
 		}
+
+		if (rol !== "vendedor") {
+			return res.status(403).json({ status: "error", mensaje: "No autorizado para esta accion" });
+		}
+
+		try {
+			const usuarioActivo = await pool.query(
+				`SELECT u.id
+				 FROM usuarios u
+				 INNER JOIN roles r ON r.id = u.id_rol
+				 WHERE u.id = $1
+				   AND u.activo = TRUE
+				   AND u.fecha_eliminacion IS NULL
+				   AND LOWER(r.nombre_rol) = 'vendedor'
+				 LIMIT 1`,
+				[usuarioId]
+			);
+
+			if (usuarioActivo.rows.length === 0) {
+				return res.status(401).json({ status: "error", mensaje: "Sesion invalida o usuario inactivo" });
+			}
+		} catch (error) {
+			console.error("Error al validar sesion de vendedor:", error);
+			return res.status(500).json({ status: "error", mensaje: "Error al validar sesion" });
+		}
+
+		req.vendedorId = usuarioId;
 		return next();
 	};
 
 	const getNegocioId = async (req, res) => {
-		const usuarioId = Number(req.session?.usuario_id || 0);
+		const usuarioId = Number(req.vendedorId || req.session?.usuario_id || 0);
 		if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
-			res.status(401).json({ mensaje: "No autorizado" });
+			res.status(401).json({ status: "error", mensaje: "No autorizado" });
 			return null;
 		}
 
@@ -22,19 +52,21 @@ function createVendedorOrdersRouter({ pool }) {
 			`SELECT id
 			 FROM negocios
 			 WHERE id_usuario = $1
+			 ORDER BY fecha_creacion DESC, id DESC
 			 LIMIT 1`,
 			[usuarioId]
 		);
 
 		if (negocio.rows.length === 0) {
-			res.status(404).json({ mensaje: "Negocio no encontrado" });
+			res.status(404).json({ status: "error", mensaje: "Negocio no encontrado" });
 			return null;
 		}
 
 		return negocio.rows[0].id;
 	};
 
-	router.get("/api/vendedor/pedidos", requireAuth, async (req, res) => {
+	// Lista pedidos que contienen items del negocio autenticado.
+	router.get("/api/vendedor/pedidos", requireVendedorAuth, async (req, res) => {
 		try {
 			const negocioId = await getNegocioId(req, res);
 			if (negocioId === null) return;
@@ -109,10 +141,13 @@ function createVendedorOrdersRouter({ pool }) {
 		}
 	});
 
-	router.put("/api/vendedor/pedidos/:pedidoId/estado", requireAuth, async (req, res) => {
+	// Actualiza estado de un pedido del negocio, con validacion de transicion.
+	router.put("/api/vendedor/pedidos/:pedidoId/estado", requireVendedorAuth, async (req, res) => {
 		try {
 			const pedidoId = Number(req.params.pedidoId);
-			const estado = String(req.body?.estado || "").trim();
+			const estado = String(req.body?.estado || "")
+				.trim()
+				.replace(/_/g, " ");
 
 			if (!Number.isInteger(pedidoId) || pedidoId <= 0) {
 				return res.status(400).json({ status: "error", mensaje: "pedidoId invalido" });
@@ -128,31 +163,74 @@ function createVendedorOrdersRouter({ pool }) {
 			const negocioId = await getNegocioId(req, res);
 			if (negocioId === null) return;
 
-			const verification = await pool.query(
-				`SELECT p.id
-				 FROM pedidos p
-				 JOIN detalle_pedido dp ON p.id = dp.id_pedido
-				 LEFT JOIN productos prod ON dp.id_producto = prod.id
-				 LEFT JOIN servicios srv ON dp.id_servicio = srv.id
-				 WHERE p.id = $1
-					 AND (prod.id_negocio = $2 OR srv.id_negocio = $2)
-				 LIMIT 1`,
-				[pedidoId, negocioId]
-			);
+			const client = await pool.connect();
+			try {
+				await client.query("BEGIN");
 
-			if (verification.rows.length === 0) {
-				return res.status(403).json({
-					status: "error",
-					mensaje: "No tienes permiso para modificar este pedido",
-				});
+				const verification = await client.query(
+					`SELECT p.id, p.estado_pedido
+					 FROM pedidos p
+					 WHERE p.id = $1
+					   AND EXISTS (
+						 SELECT 1
+						 FROM detalle_pedido dp
+						 LEFT JOIN productos prod ON dp.id_producto = prod.id
+						 LEFT JOIN servicios srv ON dp.id_servicio = srv.id
+						 WHERE dp.id_pedido = p.id
+						   AND (prod.id_negocio = $2 OR srv.id_negocio = $2)
+					   )
+					 FOR UPDATE`,
+					[pedidoId, negocioId]
+				);
+
+				if (verification.rows.length === 0) {
+					await client.query("ROLLBACK");
+					return res.status(403).json({
+						status: "error",
+						mensaje: "No tienes permiso para modificar este pedido",
+					});
+				}
+
+				const estadoActual = String(verification.rows[0].estado_pedido || "").toUpperCase();
+				const transicionesPermitidas = {
+					PENDIENTE: ["EN PREPARACION", "CANCELADO"],
+					"EN PREPARACION": ["ENVIADO", "CANCELADO"],
+					ENVIADO: ["ENTREGADO"],
+					ENTREGADO: [],
+					CANCELADO: [],
+				};
+
+				if (estadoActual === estadoNormalizado) {
+					await client.query("ROLLBACK");
+					return res.status(400).json({
+						status: "error",
+						mensaje: "El pedido ya tiene ese estado",
+					});
+				}
+
+				const permitidosDesdeEstadoActual = transicionesPermitidas[estadoActual] || [];
+				if (!permitidosDesdeEstadoActual.includes(estadoNormalizado)) {
+					await client.query("ROLLBACK");
+					return res.status(400).json({
+						status: "error",
+						mensaje: `Transicion no permitida desde ${estadoActual} hacia ${estadoNormalizado}`,
+					});
+				}
+
+				await client.query(
+					`UPDATE pedidos
+					 SET estado_pedido = $1
+					 WHERE id = $2`,
+					[estadoNormalizado, pedidoId]
+				);
+
+				await client.query("COMMIT");
+			} catch (txError) {
+				await client.query("ROLLBACK");
+				throw txError;
+			} finally {
+				client.release();
 			}
-
-			await pool.query(
-				`UPDATE pedidos
-				 SET estado_pedido = $1
-				 WHERE id = $2`,
-				[estadoNormalizado, pedidoId]
-			);
 
 			return res.json({ status: "success", mensaje: "Estado del pedido actualizado correctamente" });
 		} catch (error) {
@@ -161,7 +239,8 @@ function createVendedorOrdersRouter({ pool }) {
 		}
 	});
 
-	router.get("/api/vendedor/pedidos/estadisticas", requireAuth, async (req, res) => {
+	// Devuelve metricas por estado y ventas de los ultimos 6 meses del negocio.
+	router.get("/api/vendedor/pedidos/estadisticas", requireVendedorAuth, async (req, res) => {
 		try {
 			const negocioId = await getNegocioId(req, res);
 			if (negocioId === null) return;

@@ -3,7 +3,7 @@ const express = require("express");
 function createVendedorBusinessRouter({ pool }) {
   const router = express.Router();
 
-  const requireVendedorAuth = (req, res, next) => {
+  const requireVendedorAuth = async (req, res, next) => {
     const usuarioId = Number(req.session?.usuario_id || 0);
     const rol = String(req.session?.rol || "").toLowerCase();
 
@@ -13,6 +13,27 @@ function createVendedorBusinessRouter({ pool }) {
 
     if (rol !== "vendedor") {
       return res.status(403).json({ status: "error", mensaje: "No autorizado para esta accion" });
+    }
+
+    try {
+      const usuarioActivo = await pool.query(
+        `SELECT u.id
+         FROM usuarios u
+         INNER JOIN roles r ON r.id = u.id_rol
+         WHERE u.id = $1
+           AND u.activo = TRUE
+           AND u.fecha_eliminacion IS NULL
+           AND LOWER(r.nombre_rol) = 'vendedor'
+         LIMIT 1`,
+        [usuarioId]
+      );
+
+      if (usuarioActivo.rows.length === 0) {
+        return res.status(401).json({ status: "error", mensaje: "Sesion invalida o usuario inactivo" });
+      }
+    } catch (error) {
+      console.error("Error al validar sesion de vendedor:", error);
+      return res.status(500).json({ status: "error", mensaje: "Error al validar sesion" });
     }
 
     return next();
@@ -96,6 +117,7 @@ function createVendedorBusinessRouter({ pool }) {
          FROM negocios n
          INNER JOIN direcciones d ON d.id = n.id_direccion
          WHERE n.id_usuario = $1
+         ORDER BY n.fecha_creacion DESC, n.id DESC
          LIMIT 1`,
         [usuarioId]
       );
@@ -281,6 +303,7 @@ function createVendedorBusinessRouter({ pool }) {
         `SELECT id, id_direccion
          FROM negocios
          WHERE id_usuario = $1
+         ORDER BY fecha_creacion DESC, id DESC
          LIMIT 1`,
         [usuarioId]
       );

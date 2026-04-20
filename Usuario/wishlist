@@ -1,0 +1,246 @@
+const express = require("express");
+
+function createUsuarioWishlistRouter({ pool }) {
+	const router = express.Router();
+
+	// Obtiene el id de usuario desde la sesion activa.
+	function obtenerUsuarioSesion(req) {
+		return Number(req.session?.usuario_id || 0);
+	}
+
+	// Valida que exista una sesion autenticada.
+	function requireSession(req, res) {
+		const idUsuario = obtenerUsuarioSesion(req);
+		if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
+			res.status(401).json({ mensaje: "Debes iniciar sesion" });
+			return null;
+		}
+
+		return idUsuario;
+	}
+
+	// Verifica que el usuario de sesion siga activo en la base.
+	async function requireActiveSession(req, res) {
+		const idUsuario = requireSession(req, res);
+		if (!idUsuario) return null;
+
+		try {
+			const usuarioActivo = await pool.query(
+				`SELECT id
+				 FROM usuarios
+				 WHERE id = $1
+					 AND activo = TRUE
+					 AND fecha_eliminacion IS NULL
+				 LIMIT 1`,
+				[idUsuario]
+			);
+
+			if (usuarioActivo.rows.length === 0) {
+				res.status(401).json({ mensaje: "Sesion invalida o usuario inactivo" });
+				return null;
+			}
+
+			return idUsuario;
+		} catch (error) {
+			console.error(error);
+			res.status(500).json({ mensaje: "Error al validar sesion" });
+			return null;
+		}
+	}
+
+	// Devuelve la wishlist unica del usuario. Si no existe, la crea.
+	async function obtenerOCrearWishlistUnica(idUsuario) {
+		const existente = await pool.query(
+			`SELECT id, id_usuario, nombre, es_publica, fecha_creacion
+			 FROM listas_deseos
+			 WHERE id_usuario = $1
+			 ORDER BY fecha_creacion ASC, id ASC
+			 LIMIT 1`,
+			[idUsuario]
+		);
+
+		if (existente.rows.length > 0) {
+			return existente.rows[0];
+		}
+
+		const creada = await pool.query(
+			`INSERT INTO listas_deseos (id_usuario, nombre, es_publica)
+			 VALUES ($1, 'Mis Favoritos', FALSE)
+			 RETURNING id, id_usuario, nombre, es_publica, fecha_creacion`,
+			[idUsuario]
+		);
+
+		return creada.rows[0];
+	}
+
+	// Obtener la wishlist global del usuario con su conteo de items.
+	router.get("/:perfil(comprador|usuario)/wishlist", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		try {
+			const wishlistUnica = await obtenerOCrearWishlistUnica(idUsuario);
+			const totalItems = await pool.query(
+				`SELECT COUNT(*)::int AS total_items
+				 FROM wishlist_items
+				 WHERE id_lista = $1`,
+				[wishlistUnica.id]
+			);
+
+			return res.status(200).json({
+				wishlist: wishlistUnica,
+				total_items: totalItems.rows[0].total_items,
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al obtener wishlist" });
+		}
+	});
+
+	// Actualizar los metadatos de la wishlist global.
+	router.patch("/:perfil(comprador|usuario)/wishlist", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		const nombre = String(req.body?.nombre || "").trim() || "Mis Favoritos";
+		const esPublica = Boolean(req.body?.es_publica);
+
+		try {
+			const wishlistUnica = await obtenerOCrearWishlistUnica(idUsuario);
+			const creada = await pool.query(
+				`UPDATE listas_deseos
+				 SET nombre = $1, es_publica = $2
+				 WHERE id = $3
+				 RETURNING id, id_usuario, nombre, es_publica, fecha_creacion`,
+				[nombre, esPublica, wishlistUnica.id]
+			);
+
+			return res.status(200).json({
+				mensaje: "Wishlist unica actualizada",
+				lista: creada.rows[0],
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al actualizar la wishlist unica" });
+		}
+	});
+
+	// Obtener items de la wishlist global con informacion basica de producto/servicio.
+	router.get("/:perfil(comprador|usuario)/wishlist/items", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		try {
+			const lista = await obtenerOCrearWishlistUnica(idUsuario);
+
+			const items = await pool.query(
+				`SELECT
+					 wi.id,
+					 wi.id_producto,
+					 wi.id_servicio,
+					 wi.fecha_agregado,
+					 p.nombre AS producto_nombre,
+					 p.precio AS producto_precio,
+					 p.esta_activo AS producto_activo,
+					 s.nombre AS servicio_nombre,
+					 s.precio_base AS servicio_precio,
+					 s.esta_activo AS servicio_activo
+				 FROM wishlist_items wi
+				 LEFT JOIN productos p ON p.id = wi.id_producto
+				 LEFT JOIN servicios s ON s.id = wi.id_servicio
+				 WHERE wi.id_lista = $1
+				 ORDER BY wi.fecha_agregado DESC, wi.id DESC`,
+				[lista.id]
+			);
+
+			return res.status(200).json({
+				lista,
+				total_items: items.rows.length,
+				items: items.rows,
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al obtener los items de la lista" });
+		}
+	});
+
+	// Agregar un item a la wishlist (producto o servicio, uno a la vez).
+	router.post("/:perfil(comprador|usuario)/wishlist/items", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		const idProducto = req.body?.id_producto ? Number(req.body.id_producto) : null;
+		const idServicio = req.body?.id_servicio ? Number(req.body.id_servicio) : null;
+
+		const productoValido = Number.isInteger(idProducto) && idProducto > 0;
+		const servicioValido = Number.isInteger(idServicio) && idServicio > 0;
+
+		if ((productoValido && servicioValido) || (!productoValido && !servicioValido)) {
+			return res.status(400).json({
+				mensaje: "Debes enviar solo id_producto o solo id_servicio",
+			});
+		}
+
+		try {
+			const lista = await obtenerOCrearWishlistUnica(idUsuario);
+
+			const insertado = await pool.query(
+				`INSERT INTO wishlist_items (id_lista, id_producto, id_servicio)
+				 VALUES ($1, $2, $3)
+				 RETURNING id, id_lista, id_producto, id_servicio, fecha_agregado`,
+				[lista.id, productoValido ? idProducto : null, servicioValido ? idServicio : null]
+			);
+
+			return res.status(201).json({
+				mensaje: "Item agregado a la wishlist",
+				item: insertado.rows[0],
+			});
+		} catch (error) {
+			if (error?.code === "23505") {
+				return res.status(409).json({ mensaje: "El item ya existe en la lista" });
+			}
+
+			if (error?.code === "23503") {
+				return res.status(404).json({ mensaje: "Producto o servicio no encontrado" });
+			}
+
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al agregar item a la wishlist" });
+		}
+	});
+
+	// Eliminar un item puntual de la wishlist global.
+	router.delete("/:perfil(comprador|usuario)/wishlist/items/:idItem", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+		const idItem = Number(req.params.idItem);
+
+		if (!Number.isInteger(idItem) || idItem <= 0) {
+			return res.status(400).json({ mensaje: "Id de item invalido" });
+		}
+
+		try {
+			const lista = await obtenerOCrearWishlistUnica(idUsuario);
+
+			const eliminado = await pool.query(
+				`DELETE FROM wishlist_items
+				 WHERE id = $1 AND id_lista = $2
+				 RETURNING id`,
+				[idItem, lista.id]
+			);
+
+			if (eliminado.rows.length === 0) {
+				return res.status(404).json({ mensaje: "Item no encontrado en la lista" });
+			}
+
+			return res.status(200).json({ mensaje: "Item eliminado de la wishlist" });
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al eliminar item de la wishlist" });
+		}
+	});
+
+	return router;
+}
+
+module.exports = createUsuarioWishlistRouter;

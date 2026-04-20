@@ -7,7 +7,8 @@ const createVendedorRouter = require("./Vendedor/CRUD");
 const createVendedorOrdersRouter = require("./Vendedor/Pedidos");
 const createVendedorBusinessRouter = require("./Vendedor/Negocio");
 const createCompradorRouter = require("./Comprador/productos");
-const createCompradorCuentaRouter = require("./Comprador/cuenta");
+const createCompradorCuentaRouter = require("./Usuario/cuenta");
+const createUsuarioWishlistRouter = require("./Usuario/wishlist");
 const createCompradorCarritoRouter = require("./Comprador/carrito");
 const createCompradorPedidosRouter = require("./Comprador/pedidos");
 
@@ -57,6 +58,12 @@ app.use(
 
 app.use(
   createCompradorCuentaRouter({
+    pool,
+  })
+);
+
+app.use(
+  createUsuarioWishlistRouter({
     pool,
   })
 );

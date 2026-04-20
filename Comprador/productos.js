@@ -92,18 +92,34 @@ function createCompradorRouter({ pool }) {
            p.id,
            p.nombre,
            p.calificacion,
-           p.precio,
+           p.precio AS precio_original,
+           CASE
+             WHEN d.id IS NOT NULL
+               AND d.codigo_cupon IS NULL
+               AND CURRENT_TIMESTAMP BETWEEN d.fecha_inicio AND d.fecha_fin
+             THEN ROUND((p.precio * (1 - (d.porcentaje_descuento / 100)))::numeric, 2)
+             ELSE p.precio
+           END AS precio,
+           CASE
+             WHEN d.id IS NOT NULL
+               AND d.codigo_cupon IS NULL
+               AND CURRENT_TIMESTAMP BETWEEN d.fecha_inicio AND d.fecha_fin
+             THEN d.porcentaje_descuento
+             ELSE NULL
+           END AS porcentaje_descuento,
            pi.url_imagen AS imagen_principal,
            COALESCE(n.nombre_comercial, '') AS empresa,
            COUNT(r.id) AS numero_resenas
          FROM productos p
          INNER JOIN producto_categoria pc ON pc.id_producto = p.id
          LEFT JOIN negocios n ON n.id = p.id_negocio
+         LEFT JOIN descuentos d ON d.id = p.id_descuento
          LEFT JOIN producto_imagenes pi ON pi.id_producto = p.id AND pi.es_principal = TRUE
          LEFT JOIN resenas r ON r.id_producto = p.id
          WHERE p.esta_activo = TRUE
            AND ${filtros.join(" AND ")}
-         GROUP BY p.id, p.nombre, p.calificacion, p.precio, pi.url_imagen, n.nombre_comercial, p.fecha_registro
+         GROUP BY p.id, p.nombre, p.calificacion, p.precio, pi.url_imagen, n.nombre_comercial, p.fecha_registro,
+                  d.id, d.codigo_cupon, d.porcentaje_descuento, d.fecha_inicio, d.fecha_fin
          ORDER BY ${orderBy}`,
         valores
       );
@@ -193,18 +209,34 @@ function createCompradorRouter({ pool }) {
            s.id,
            s.nombre,
            s.calificacion,
-           s.precio_base AS precio,
+           s.precio_base AS precio_original,
+           CASE
+             WHEN d.id IS NOT NULL
+               AND d.codigo_cupon IS NULL
+               AND CURRENT_TIMESTAMP BETWEEN d.fecha_inicio AND d.fecha_fin
+             THEN ROUND((s.precio_base * (1 - (d.porcentaje_descuento / 100)))::numeric, 2)
+             ELSE s.precio_base
+           END AS precio,
+           CASE
+             WHEN d.id IS NOT NULL
+               AND d.codigo_cupon IS NULL
+               AND CURRENT_TIMESTAMP BETWEEN d.fecha_inicio AND d.fecha_fin
+             THEN d.porcentaje_descuento
+             ELSE NULL
+           END AS porcentaje_descuento,
            si.url_imagen AS imagen_principal,
            COALESCE(n.nombre_comercial, '') AS empresa,
            COUNT(r.id) AS numero_resenas
          FROM servicios s
          INNER JOIN servicio_categoria sc ON sc.id_servicio = s.id
          INNER JOIN negocios n ON n.id = s.id_negocio
+         LEFT JOIN descuentos d ON d.id = s.id_descuento
          LEFT JOIN servicio_imagenes si ON si.id_servicio = s.id AND si.es_principal = TRUE
          LEFT JOIN resenas r ON r.id_servicio = s.id
          WHERE s.esta_activo = TRUE
            AND ${filtros.join(" AND ")}
-         GROUP BY s.id, s.nombre, s.calificacion, s.precio_base, si.url_imagen, n.nombre_comercial, s.fecha_registro
+         GROUP BY s.id, s.nombre, s.calificacion, s.precio_base, si.url_imagen, n.nombre_comercial, s.fecha_registro,
+                  d.id, d.codigo_cupon, d.porcentaje_descuento, d.fecha_inicio, d.fecha_fin
          ORDER BY ${orderBy}`,
         valores
       );
@@ -242,11 +274,41 @@ function createCompradorRouter({ pool }) {
            p.nombre,
            p.descripcion,
            p.calificacion,
-           p.precio,
+           p.precio AS precio_original,
+           CASE
+             WHEN d.id IS NOT NULL
+               AND d.codigo_cupon IS NULL
+               AND CURRENT_TIMESTAMP BETWEEN d.fecha_inicio AND d.fecha_fin
+             THEN ROUND((p.precio * (1 - (d.porcentaje_descuento / 100)))::numeric, 2)
+             ELSE p.precio
+           END AS precio,
+           CASE
+             WHEN d.id IS NOT NULL
+               AND d.codigo_cupon IS NULL
+               AND CURRENT_TIMESTAMP BETWEEN d.fecha_inicio AND d.fecha_fin
+             THEN d.porcentaje_descuento
+             ELSE NULL
+           END AS porcentaje_descuento,
            p.sku,
            p.fecha_registro,
            p.stock_total,
            img.url_imagen AS imagen_principal,
+           COALESCE(
+             (
+               SELECT json_agg(
+                 json_build_object(
+                   'id', pi.id,
+                   'url_imagen', pi.url_imagen,
+                   'es_principal', pi.es_principal,
+                   'orden_visual', pi.orden_visual
+                 )
+                 ORDER BY pi.es_principal DESC, pi.orden_visual ASC, pi.id ASC
+               )
+               FROM producto_imagenes pi
+               WHERE pi.id_producto = p.id
+             ),
+             '[]'::json
+           ) AS galeria_imagenes,
            COALESCE(n.nombre_comercial, '') AS empresa,
            COALESCE(
              (
@@ -267,6 +329,7 @@ function createCompradorRouter({ pool }) {
            ) AS categorias
          FROM productos p
          LEFT JOIN negocios n ON n.id = p.id_negocio
+         LEFT JOIN descuentos d ON d.id = p.id_descuento
          LEFT JOIN producto_imagenes img ON img.id_producto = p.id AND img.es_principal = TRUE
          WHERE p.id = $1
            AND p.esta_activo = TRUE
@@ -303,9 +366,12 @@ function createCompradorRouter({ pool }) {
           descripcion: producto.descripcion,
           calificacion: producto.calificacion !== null ? Number(producto.calificacion) : null,
           precio: Number(producto.precio),
+          precio_original: Number(producto.precio_original),
+          porcentaje_descuento: producto.porcentaje_descuento !== null ? Number(producto.porcentaje_descuento) : null,
           sku: producto.sku,
           fecha_registro: producto.fecha_registro,
           imagen_principal: producto.imagen_principal,
+          galeria_imagenes: producto.galeria_imagenes,
           empresa: producto.empresa,
           stock_total: Number(producto.stock_total),
           numero_resenas: Number(producto.numero_resenas),
@@ -344,10 +410,40 @@ function createCompradorRouter({ pool }) {
            s.nombre,
            s.descripcion,
            s.calificacion,
-           s.precio_base,
+           s.precio_base AS precio_original,
+           CASE
+             WHEN d.id IS NOT NULL
+               AND d.codigo_cupon IS NULL
+               AND CURRENT_TIMESTAMP BETWEEN d.fecha_inicio AND d.fecha_fin
+             THEN ROUND((s.precio_base * (1 - (d.porcentaje_descuento / 100)))::numeric, 2)
+             ELSE s.precio_base
+           END AS precio,
+           CASE
+             WHEN d.id IS NOT NULL
+               AND d.codigo_cupon IS NULL
+               AND CURRENT_TIMESTAMP BETWEEN d.fecha_inicio AND d.fecha_fin
+             THEN d.porcentaje_descuento
+             ELSE NULL
+           END AS porcentaje_descuento,
            s.duracion_minutos,
            s.fecha_registro,
            img.url_imagen AS imagen_principal,
+           COALESCE(
+             (
+               SELECT json_agg(
+                 json_build_object(
+                   'id', si.id,
+                   'url_imagen', si.url_imagen,
+                   'es_principal', si.es_principal,
+                   'orden_visual', si.orden_visual
+                 )
+                 ORDER BY si.es_principal DESC, si.orden_visual ASC, si.id ASC
+               )
+               FROM servicio_imagenes si
+               WHERE si.id_servicio = s.id
+             ),
+             '[]'::json
+           ) AS galeria_imagenes,
            COALESCE(n.nombre_comercial, '') AS empresa,
            COALESCE(
              (
@@ -359,6 +455,7 @@ function createCompradorRouter({ pool }) {
            ) AS numero_resenas
          FROM servicios s
          LEFT JOIN negocios n ON n.id = s.id_negocio
+         LEFT JOIN descuentos d ON d.id = s.id_descuento
          LEFT JOIN servicio_imagenes img ON img.id_servicio = s.id AND img.es_principal = TRUE
          WHERE s.id = $1
            AND s.esta_activo = TRUE
@@ -425,10 +522,13 @@ function createCompradorRouter({ pool }) {
           nombre: servicio.nombre,
           descripcion: servicio.descripcion,
           calificacion: servicio.calificacion !== null ? Number(servicio.calificacion) : null,
-          precio: Number(servicio.precio_base),
+          precio: Number(servicio.precio),
+          precio_original: Number(servicio.precio_original),
+          porcentaje_descuento: servicio.porcentaje_descuento !== null ? Number(servicio.porcentaje_descuento) : null,
           duracion_minutos: servicio.duracion_minutos,
           fecha_registro: servicio.fecha_registro,
           imagen_principal: servicio.imagen_principal,
+          galeria_imagenes: servicio.galeria_imagenes,
           empresa: servicio.empresa,
           numero_resenas: Number(servicio.numero_resenas),
           categorias: categoriasResult.rows.map((categoria) => categoria.nombre_categoria),

@@ -69,9 +69,23 @@ function createCompradorCarritoRouter({ pool }) {
 			   ci.id_servicio,
 			   ci.id_agenda_seleccionada,
 			   p.nombre AS nombre_producto,
-			   p.precio AS precio_producto,
+			   p.precio AS precio_producto_original,
+			   CASE
+			     WHEN dp.id IS NOT NULL
+			       AND dp.codigo_cupon IS NULL
+			       AND CURRENT_TIMESTAMP BETWEEN dp.fecha_inicio AND dp.fecha_fin
+			     THEN ROUND((p.precio * (1 - (dp.porcentaje_descuento / 100)))::numeric, 2)
+			     ELSE p.precio
+			   END AS precio_producto_vigente,
 			   s.nombre AS nombre_servicio,
-			   s.precio_base AS precio_servicio,
+			   s.precio_base AS precio_servicio_original,
+			   CASE
+			     WHEN ds.id IS NOT NULL
+			       AND ds.codigo_cupon IS NULL
+			       AND CURRENT_TIMESTAMP BETWEEN ds.fecha_inicio AND ds.fecha_fin
+			     THEN ROUND((s.precio_base * (1 - (ds.porcentaje_descuento / 100)))::numeric, 2)
+			     ELSE s.precio_base
+			   END AS precio_servicio_vigente,
 			   COALESCE(np.nombre_comercial, ns.nombre_comercial, '') AS empresa,
 			   ag.fecha_hora_inicio,
 			   ag.fecha_hora_fin,
@@ -79,8 +93,10 @@ function createCompradorCarritoRouter({ pool }) {
 			 FROM carrito_items ci
 			 INNER JOIN carrito c ON c.id = ci.id_carrito
 			 LEFT JOIN productos p ON p.id = ci.id_producto
+			 LEFT JOIN descuentos dp ON dp.id = p.id_descuento
 			 LEFT JOIN negocios np ON np.id = p.id_negocio
 			 LEFT JOIN servicios s ON s.id = ci.id_servicio
+			 LEFT JOIN descuentos ds ON ds.id = s.id_descuento
 			 LEFT JOIN negocios ns ON ns.id = s.id_negocio
 			 LEFT JOIN agenda_servicios ag ON ag.id = ci.id_agenda_seleccionada
 			 WHERE c.id_usuario = $1
@@ -93,8 +109,11 @@ function createCompradorCarritoRouter({ pool }) {
 		const items = result.rows.map((item) => {
 			const esProducto = item.id_producto !== null;
 			const precioUnitario = esProducto
-				? Number(item.precio_producto || 0)
-				: Number(item.precio_servicio || 0);
+				? Number(item.precio_producto_vigente || 0)
+				: Number(item.precio_servicio_vigente || 0);
+			const precioOriginal = esProducto
+				? Number(item.precio_producto_original || 0)
+				: Number(item.precio_servicio_original || 0);
 			const cantidad = Number(item.cantidad);
 			const subtotal = precioUnitario * cantidad;
 
@@ -108,6 +127,7 @@ function createCompradorCarritoRouter({ pool }) {
 				empresa: item.empresa,
 				cantidad,
 				precio_unitario: precioUnitario,
+				precio_unitario_original: precioOriginal,
 				subtotal,
 				agenda: item.id_agenda_seleccionada
 					? {

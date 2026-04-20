@@ -1,8 +1,48 @@
 const express = require("express");
 const crypto = require("crypto");
 
+const ROLE_NAMES_BY_ID = {
+  1: "comprador",
+  2: "vendedor",
+  3: "admin",
+};
+
 function hashPassword(password) {
-  return crypto.createHash("sha256").update(String(password)).digest("hex");  //Aplica SHA-256 al password y lo devuelve como un hash hexadecimal
+  return crypto.createHash("sha256").update(String(password)).digest("hex");
+}
+
+function normalizeRoleId(rawRole) {
+  if (rawRole === undefined || rawRole === null || rawRole === "") {
+    return 1;
+  }
+
+  const normalizedText = String(rawRole).trim().toLowerCase();
+  if (["comprador", "cliente", "usuario"].includes(normalizedText)) {
+    return 1;
+  }
+
+  if (["vendedor", "seller"].includes(normalizedText)) {
+    return 2;
+  }
+
+  if (["admin", "administrador"].includes(normalizedText)) {
+    return 3;
+  }
+
+  const normalizedNumber = Number(rawRole);
+  if (Number.isInteger(normalizedNumber) && [1, 2, 3].includes(normalizedNumber)) {
+    return normalizedNumber;
+  }
+
+  return null;
+}
+
+function getRoleNameById(idRol, dbRoleName) {
+  if (dbRoleName) {
+    return String(dbRoleName).trim().toLowerCase();
+  }
+
+  return ROLE_NAMES_BY_ID[idRol] || "comprador";
 }
 
 
@@ -21,36 +61,37 @@ function createLoginRouter({ pool }) {
       }
 
       const result = await pool.query(
-        `SELECT u.id, u.nombre, u.email, u.password_hash, r.nombre_rol
+        `SELECT u.id, u.nombre, u.email, u.password_hash, u.id_rol,
+                u.activo, u.fecha_eliminacion,
+                COALESCE(LOWER(r.nombre_rol), '') AS nombre_rol
          FROM usuarios u
-         INNER JOIN roles r ON r.id = u.id_rol
+         LEFT JOIN roles r ON r.id = u.id_rol
          WHERE LOWER(u.email)=LOWER($1)
-           AND u.activo = TRUE
-           AND u.fecha_eliminacion IS NULL
          LIMIT 1`,
         [correoFinal]
       );
-      
-      
 
       if (result.rows.length === 0) {
         return res.status(401).json({ mensaje: "Correo no registrado" });
       }
 
-      if (result.activo === false) {
+      const usuario = result.rows[0];
+
+      if (usuario.activo === false || usuario.fecha_eliminacion !== null) {
         return res.status(403).json({ mensaje: "Cuenta inactiva, contacte al administrador" });
       }
 
-      const usuario = result.rows[0];
       const hashIngresado = hashPassword(passwordPlano);
 
       if (hashIngresado !== usuario.password_hash) {
         return res.status(401).json({ mensaje: "Contraseña incorrecta" });
       }
 
+      const rolNormalizado = getRoleNameById(usuario.id_rol, usuario.nombre_rol);
+
       req.session.usuario = usuario.nombre;
       req.session.usuario_id = usuario.id;
-      req.session.rol = usuario.nombre_rol.toLowerCase();
+      req.session.rol = rolNormalizado;
 
       return res.status(200).json({
         mensaje: "Sesion iniciada correctamente",
@@ -58,7 +99,7 @@ function createLoginRouter({ pool }) {
           id: usuario.id,
           nombre: usuario.nombre,
           email: usuario.email,
-          rol: usuario.nombre_rol,
+          rol: rolNormalizado,
         },
       });
 
@@ -86,7 +127,7 @@ function createLoginRouter({ pool }) {
     const nombreFinal = (nombre || nombre_usuario || "").trim();
     const emailFinal = (email || correo || "").trim().toLowerCase();
     const passwordPlano = contrasena || password;
-    const rolSolicitado = id_rol;
+    const rolSolicitado = normalizeRoleId(id_rol ?? tipo_usuario);
 
     try {
       if (!nombreFinal || !emailFinal || !passwordPlano) {  //#Sugeto a cambios por el front
@@ -95,7 +136,7 @@ function createLoginRouter({ pool }) {
         });
       }
 
-      if (rolSolicitado && ![1, 2, 3].includes(rolSolicitado)) {
+      if (rolSolicitado === null) {
         return res.status(400).json({
           mensaje: "Rol solicitado no es válido",
         });
@@ -131,8 +172,9 @@ function createLoginRouter({ pool }) {
 
   // Logout
   router.post("/logout", (req, res) => {
-    req.session.destroy();
-    res.redirect("/login");
+    req.session.destroy(() => {
+      res.redirect("/login");
+    });
   });
 
   return router;

@@ -3,6 +3,7 @@ const express = require("express");
 function createVendedorRouter({ pool }) {
   const router = express.Router();
 
+  // Normaliza un arreglo de IDs y elimina duplicados/valores invalidos.
   function normalizarCategoriasEntrada(rawCategorias) {
     if (!Array.isArray(rawCategorias)) {
       return null;
@@ -11,19 +12,18 @@ function createVendedorRouter({ pool }) {
     return [...new Set(rawCategorias.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
   }
 
+  // Crea una categoria (producto/servicio/ambos) con soporte de jerarquia por id_padre.
   router.post("/api/vendedor/categorias", async (req, res) => {
     try {
-      const { nombre_categoria, descripcion, icon_url, tipo } = req.body;
+      const { nombre_categoria, descripcion, tipo, id_padre } = req.body;
       const nombre = String(nombre_categoria || "").trim();
       const tipoNormalizado = String(tipo || "").trim().toLowerCase();
+      const idPadreNum =
+        id_padre === undefined || id_padre === null || id_padre === "" ? null : Number(id_padre);
       const descripcionFinal =
         descripcion === undefined || descripcion === null || String(descripcion).trim() === ""
           ? null
           : String(descripcion).trim();
-      const iconUrlFinal =
-        icon_url === undefined || icon_url === null || String(icon_url).trim() === ""
-          ? null
-          : String(icon_url).trim();
 
       if (!nombre) {
         return res.status(400).json({ error: "nombre_categoria es obligatorio" });
@@ -33,11 +33,22 @@ function createVendedorRouter({ pool }) {
         return res.status(400).json({ error: "tipo invalido. Usa producto, servicio o ambos" });
       }
 
+      if (idPadreNum !== null && (!Number.isInteger(idPadreNum) || idPadreNum <= 0)) {
+        return res.status(400).json({ error: "id_padre invalido" });
+      }
+
+      if (idPadreNum !== null) {
+        const padre = await pool.query("SELECT id FROM categorias WHERE id = $1 LIMIT 1", [idPadreNum]);
+        if (padre.rows.length === 0) {
+          return res.status(404).json({ error: "Categoria padre no encontrada" });
+        }
+      }
+
       const result = await pool.query(
-        `INSERT INTO categorias (nombre_categoria, descripcion, icon_url, tipo)
+        `INSERT INTO categorias (nombre_categoria, id_padre, tipo, descripcion)
          VALUES ($1, $2, $3, $4)
-         RETURNING id, nombre_categoria, descripcion, icon_url, tipo`,
-        [nombre, descripcionFinal, iconUrlFinal, tipoNormalizado]
+         RETURNING id, nombre_categoria, id_padre, tipo, descripcion`,
+        [nombre, idPadreNum, tipoNormalizado, descripcionFinal]
       );
 
       return res.status(201).json({
@@ -46,7 +57,7 @@ function createVendedorRouter({ pool }) {
       });
     } catch (error) {
       if (error.code === "23505") {
-        return res.status(409).json({ error: "La categoria ya existe para ese tipo" });
+        return res.status(409).json({ error: "La categoria ya existe para ese nivel" });
       }
 
       console.error(error);
@@ -54,6 +65,7 @@ function createVendedorRouter({ pool }) {
     }
   });
 
+  // Lista categorias y permite filtrar por tipo compatible.
   router.get("/api/vendedor/categorias", async (req, res) => {
     try {
       const tipo =
@@ -79,7 +91,7 @@ function createVendedorRouter({ pool }) {
       const whereClause = filtros.length > 0 ? `WHERE ${filtros.join(" AND ")}` : "";
 
       const result = await pool.query(
-        `SELECT id, nombre_categoria
+        `SELECT id, nombre_categoria, id_padre, tipo, descripcion
          FROM categorias
          ${whereClause}
          ORDER BY nombre_categoria ASC`,
@@ -93,7 +105,7 @@ function createVendedorRouter({ pool }) {
     }
   });
 
-  // READ
+  // Lista productos por negocio incluyendo imagen principal.
   router.get("/api/vendedor/productos/:id_negocio", async (req, res) => {
     const idNegocio = Number(req.params.id_negocio);
 
@@ -103,7 +115,8 @@ function createVendedorRouter({ pool }) {
 
     try {
       const result = await pool.query(
-        `SELECT p.id, p.id_negocio, p.nombre, p.descripcion, p.precio, p.stock_total, p.sku, p.esta_activo, p.fecha_registro,
+        `SELECT p.id, p.id_negocio, p.nombre, p.descripcion, p.precio, p.stock_total, p.sku,
+          p.id_descuento, p.esta_activo, p.fecha_registro,
                 (
                   SELECT pi.url_imagen
                   FROM producto_imagenes pi
@@ -124,13 +137,15 @@ function createVendedorRouter({ pool }) {
     }
   });
 
-  // CREATE
+  // Crea producto con imagenes opcionales y descuento opcional.
   router.post("/api/vendedor/productos", async (req, res) => {
-    const { nombre, descripcion, precio, id_negocio, sku, stock_total, imagenes } = req.body;
+    const { nombre, descripcion, precio, id_negocio, sku, stock_total, imagenes, id_descuento } = req.body;
     const idNegocio = Number(id_negocio);
     const precioNum = Number(precio);
     const stockTotalNum =
       stock_total === undefined || stock_total === null || stock_total === "" ? 0 : Number(stock_total);
+    const idDescuentoNum =
+      id_descuento === undefined || id_descuento === null || id_descuento === "" ? null : Number(id_descuento);
 
     if (!nombre || !Number.isFinite(precioNum) || !Number.isInteger(idNegocio) || idNegocio <= 0) {
       return res.status(400).json({ error: "Datos incompletos o invalidos" });
@@ -138,6 +153,10 @@ function createVendedorRouter({ pool }) {
 
     if (!Number.isInteger(stockTotalNum) || stockTotalNum < 0) {
       return res.status(400).json({ error: "stock_total invalido" });
+    }
+
+    if (idDescuentoNum !== null && (!Number.isInteger(idDescuentoNum) || idDescuentoNum <= 0)) {
+      return res.status(400).json({ error: "id_descuento invalido" });
     }
 
     if (imagenes !== undefined && !Array.isArray(imagenes)) {
@@ -159,10 +178,18 @@ function createVendedorRouter({ pool }) {
         return res.status(404).json({ error: "Negocio no encontrado" });
       }
 
+      if (idDescuentoNum !== null) {
+        const descuento = await client.query("SELECT id FROM descuentos WHERE id = $1 LIMIT 1", [idDescuentoNum]);
+        if (descuento.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Descuento no encontrado" });
+        }
+      }
+
       const result = await client.query(
-        `INSERT INTO productos (nombre, descripcion, precio, id_negocio, sku, stock_total)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         RETURNING id, id_negocio, nombre, descripcion, precio, stock_total, sku, esta_activo, fecha_registro`,
+        `INSERT INTO productos (nombre, descripcion, precio, id_negocio, sku, stock_total, id_descuento)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         RETURNING id, id_negocio, nombre, descripcion, precio, stock_total, sku, id_descuento, esta_activo, fecha_registro`,
         [
           String(nombre).trim(),
           descripcion ? String(descripcion).trim() : null,
@@ -170,6 +197,7 @@ function createVendedorRouter({ pool }) {
           idNegocio,
           sku || null,
           stockTotalNum,
+          idDescuentoNum,
         ]
       );
 
@@ -211,12 +239,14 @@ function createVendedorRouter({ pool }) {
     }
   });
 
-  // UPDATE
+  // Actualiza producto y, si se envia, reemplaza su galeria completa de imagenes.
   router.put("/api/vendedor/productos/:id", async (req, res) => {
     const idProducto = Number(req.params.id);
-    const { nombre, descripcion, precio, sku, esta_activo, stock_total, imagenes } = req.body;
+    const { nombre, descripcion, precio, sku, esta_activo, stock_total, imagenes, id_descuento } = req.body;
     const stockTotalNum =
       stock_total === undefined || stock_total === null || stock_total === "" ? null : Number(stock_total);
+    const idDescuentoNum =
+      id_descuento === undefined || id_descuento === null || id_descuento === "" ? null : Number(id_descuento);
 
     if (!Number.isInteger(idProducto) || idProducto <= 0) {
       return res.status(400).json({ error: "id invalido" });
@@ -228,6 +258,10 @@ function createVendedorRouter({ pool }) {
 
     if (stockTotalNum !== null && (!Number.isInteger(stockTotalNum) || stockTotalNum < 0)) {
       return res.status(400).json({ error: "stock_total invalido" });
+    }
+
+    if (idDescuentoNum !== null && (!Number.isInteger(idDescuentoNum) || idDescuentoNum <= 0)) {
+      return res.status(400).json({ error: "id_descuento invalido" });
     }
 
     if (imagenes !== undefined && !Array.isArray(imagenes)) {
@@ -246,6 +280,14 @@ function createVendedorRouter({ pool }) {
     try {
       await client.query("BEGIN");
 
+      if (idDescuentoNum !== null) {
+        const descuento = await client.query("SELECT id FROM descuentos WHERE id = $1 LIMIT 1", [idDescuentoNum]);
+        if (descuento.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Descuento no encontrado" });
+        }
+      }
+
       const result = await client.query(
         `UPDATE productos
          SET nombre = $1,
@@ -253,9 +295,10 @@ function createVendedorRouter({ pool }) {
              precio = $3,
              sku = $4,
              esta_activo = $5,
-             stock_total = COALESCE($6, stock_total)
-         WHERE id = $7
-         RETURNING id, id_negocio, nombre, descripcion, precio, stock_total, sku, esta_activo, fecha_registro`,
+             stock_total = COALESCE($6, stock_total),
+             id_descuento = $7
+         WHERE id = $8
+         RETURNING id, id_negocio, nombre, descripcion, precio, stock_total, sku, id_descuento, esta_activo, fecha_registro`,
         [
           String(nombre).trim(),
           descripcion ? String(descripcion).trim() : null,
@@ -263,6 +306,7 @@ function createVendedorRouter({ pool }) {
           sku || null,
           activo,
           stockTotalNum,
+          idDescuentoNum,
           idProducto,
         ]
       );
@@ -312,6 +356,7 @@ function createVendedorRouter({ pool }) {
     }
   });
 
+  // Reemplaza las categorias asociadas a un producto.
   router.put("/api/vendedor/productos/:id/categorias", async (req, res) => {
     const idProducto = Number(req.params.id);
     const categorias = normalizarCategoriasEntrada(req.body?.id_categorias);
@@ -385,7 +430,7 @@ function createVendedorRouter({ pool }) {
     }
   });
 
-  // DELETE (soft delete)
+  // Baja logica de producto (no elimina fisicamente el registro).
   router.delete("/api/vendedor/productos/:id", async (req, res) => {
     const idProducto = Number(req.params.id);
 
@@ -413,7 +458,7 @@ function createVendedorRouter({ pool }) {
     }
   });
 
-  // READ
+  // Lista servicios por negocio incluyendo imagen principal.
   router.get("/api/vendedor/servicios/:id_negocio", async (req, res) => {
     const idNegocio = Number(req.params.id_negocio);
 
@@ -423,7 +468,8 @@ function createVendedorRouter({ pool }) {
 
     try {
       const result = await pool.query(
-        `SELECT s.id, s.id_negocio, s.nombre, s.descripcion, s.precio_base, s.duracion_minutos, s.calificacion, s.esta_activo, s.fecha_registro,
+        `SELECT s.id, s.id_negocio, s.nombre, s.descripcion, s.precio_base, s.duracion_minutos,
+          s.calificacion, s.id_descuento, s.esta_activo, s.fecha_registro,
                 (
                   SELECT si.url_imagen
                   FROM servicio_imagenes si
@@ -444,15 +490,17 @@ function createVendedorRouter({ pool }) {
     }
   });
 
-  // CREATE
+  // Crea servicio con imagenes opcionales y descuento opcional.
   router.post("/api/vendedor/servicios", async (req, res) => {
-    const { nombre, descripcion, precio_base, duracion_minutos, id_negocio, imagenes } = req.body;
+    const { nombre, descripcion, precio_base, duracion_minutos, id_negocio, imagenes, id_descuento } = req.body;
     const idNegocio = Number(id_negocio);
     const precioBaseNum = Number(precio_base);
     const duracionNum =
       duracion_minutos === undefined || duracion_minutos === null || duracion_minutos === ""
         ? null
         : Number(duracion_minutos);
+    const idDescuentoNum =
+      id_descuento === undefined || id_descuento === null || id_descuento === "" ? null : Number(id_descuento);
 
     if (!nombre || !Number.isFinite(precioBaseNum) || !Number.isInteger(idNegocio) || idNegocio <= 0) {
       return res.status(400).json({ error: "Datos incompletos o invalidos" });
@@ -460,6 +508,10 @@ function createVendedorRouter({ pool }) {
 
     if (duracionNum !== null && (!Number.isInteger(duracionNum) || duracionNum <= 0)) {
       return res.status(400).json({ error: "duracion_minutos invalido" });
+    }
+
+    if (idDescuentoNum !== null && (!Number.isInteger(idDescuentoNum) || idDescuentoNum <= 0)) {
+      return res.status(400).json({ error: "id_descuento invalido" });
     }
 
     if (imagenes !== undefined && !Array.isArray(imagenes)) {
@@ -481,16 +533,25 @@ function createVendedorRouter({ pool }) {
         return res.status(404).json({ error: "Negocio no encontrado" });
       }
 
+      if (idDescuentoNum !== null) {
+        const descuento = await client.query("SELECT id FROM descuentos WHERE id = $1 LIMIT 1", [idDescuentoNum]);
+        if (descuento.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Descuento no encontrado" });
+        }
+      }
+
       const result = await client.query(
-        `INSERT INTO servicios (nombre, descripcion, precio_base, duracion_minutos, id_negocio)
-         VALUES ($1,$2,$3,$4,$5)
-         RETURNING id, id_negocio, nombre, descripcion, precio_base, duracion_minutos, calificacion, esta_activo, fecha_registro`,
+        `INSERT INTO servicios (nombre, descripcion, precio_base, duracion_minutos, id_negocio, id_descuento)
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING id, id_negocio, nombre, descripcion, precio_base, duracion_minutos, calificacion, id_descuento, esta_activo, fecha_registro`,
         [
           String(nombre).trim(),
           descripcion ? String(descripcion).trim() : null,
           precioBaseNum,
           duracionNum,
           idNegocio,
+          idDescuentoNum,
         ]
       );
 
@@ -528,15 +589,17 @@ function createVendedorRouter({ pool }) {
     }
   });
 
-  // UPDATE
+  // Actualiza servicio y, si se envia, reemplaza su galeria completa de imagenes.
   router.put("/api/vendedor/servicios/:id", async (req, res) => {
     const idServicio = Number(req.params.id);
-    const { nombre, descripcion, precio_base, duracion_minutos, esta_activo, imagenes } = req.body;
+    const { nombre, descripcion, precio_base, duracion_minutos, esta_activo, imagenes, id_descuento } = req.body;
     const precioBaseNum = Number(precio_base);
     const duracionNum =
       duracion_minutos === undefined || duracion_minutos === null || duracion_minutos === ""
         ? null
         : Number(duracion_minutos);
+    const idDescuentoNum =
+      id_descuento === undefined || id_descuento === null || id_descuento === "" ? null : Number(id_descuento);
 
     if (!Number.isInteger(idServicio) || idServicio <= 0) {
       return res.status(400).json({ error: "id invalido" });
@@ -548,6 +611,10 @@ function createVendedorRouter({ pool }) {
 
     if (duracionNum !== null && (!Number.isInteger(duracionNum) || duracionNum <= 0)) {
       return res.status(400).json({ error: "duracion_minutos invalido" });
+    }
+
+    if (idDescuentoNum !== null && (!Number.isInteger(idDescuentoNum) || idDescuentoNum <= 0)) {
+      return res.status(400).json({ error: "id_descuento invalido" });
     }
 
     if (imagenes !== undefined && !Array.isArray(imagenes)) {
@@ -566,21 +633,31 @@ function createVendedorRouter({ pool }) {
     try {
       await client.query("BEGIN");
 
+      if (idDescuentoNum !== null) {
+        const descuento = await client.query("SELECT id FROM descuentos WHERE id = $1 LIMIT 1", [idDescuentoNum]);
+        if (descuento.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ error: "Descuento no encontrado" });
+        }
+      }
+
       const result = await client.query(
         `UPDATE servicios
          SET nombre = $1,
              descripcion = $2,
              precio_base = $3,
              duracion_minutos = $4,
-             esta_activo = $5
-         WHERE id = $6
-         RETURNING id, id_negocio, nombre, descripcion, precio_base, duracion_minutos, calificacion, esta_activo, fecha_registro`,
+             esta_activo = $5,
+             id_descuento = $6
+         WHERE id = $7
+         RETURNING id, id_negocio, nombre, descripcion, precio_base, duracion_minutos, calificacion, id_descuento, esta_activo, fecha_registro`,
         [
           String(nombre).trim(),
           descripcion ? String(descripcion).trim() : null,
           precioBaseNum,
           duracionNum,
           activo,
+          idDescuentoNum,
           idServicio,
         ]
       );
@@ -626,6 +703,7 @@ function createVendedorRouter({ pool }) {
     }
   });
 
+  // Reemplaza las categorias asociadas a un servicio.
   router.put("/api/vendedor/servicios/:id/categorias", async (req, res) => {
     const idServicio = Number(req.params.id);
     const categorias = normalizarCategoriasEntrada(req.body?.id_categorias);
@@ -699,7 +777,7 @@ function createVendedorRouter({ pool }) {
     }
   });
 
-  // DELETE (soft delete)
+  // Baja logica de servicio (no elimina fisicamente el registro).
   router.delete("/api/vendedor/servicios/:id", async (req, res) => {
     const idServicio = Number(req.params.id);
 

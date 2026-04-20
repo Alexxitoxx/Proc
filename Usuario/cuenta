@@ -48,7 +48,7 @@ function createCompradorCuentaRouter({ pool }) {
 	}
 
 	// Obtener informacion del usuario autenticado
-	router.get("/comprador/cuenta", async (req, res) => {
+	router.get("/:perfil(comprador|usuario)/cuenta", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -88,7 +88,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Actualizar informacion del usuario autenticado
-	router.put("/comprador/cuenta", async (req, res) => {
+	router.put("/:perfil(comprador|usuario)/cuenta", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -140,7 +140,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Agregar direccion del usuario autenticado
-	router.post("/comprador/cuenta/direcciones", async (req, res) => {
+	router.post("/:perfil(comprador|usuario)/cuenta/direcciones", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -224,7 +224,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Consultar direcciones del usuario autenticado
-	router.get("/comprador/cuenta/direcciones", async (req, res) => {
+	router.get("/:perfil(comprador|usuario)/cuenta/direcciones", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -256,7 +256,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Eliminar direccion del usuario autenticado
-	router.delete("/comprador/cuenta/direcciones/:idDireccion", async (req, res) => {
+	router.delete("/:perfil(comprador|usuario)/cuenta/direcciones/:idDireccion", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -328,7 +328,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Agregar metodo de pago del usuario autenticado
-	router.post("/comprador/cuenta/metodos-pago", async (req, res) => {
+	router.post("/:perfil(comprador|usuario)/cuenta/metodos-pago", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -379,7 +379,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Consultar metodos de pago del usuario autenticado
-	router.get("/comprador/cuenta/metodos-pago", async (req, res) => {
+	router.get("/:perfil(comprador|usuario)/cuenta/metodos-pago", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -404,7 +404,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Eliminar metodo de pago del usuario autenticado
-	router.delete("/comprador/cuenta/metodos-pago/:idMetodoPago", async (req, res) => {
+	router.delete("/:perfil(comprador|usuario)/cuenta/metodos-pago/:idMetodoPago", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -433,7 +433,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Actualizar contrasena del usuario autenticado
-	router.put("/comprador/cuenta/contrasena", async (req, res) => {
+	router.put("/:perfil(comprador|usuario)/cuenta/contrasena", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 
@@ -479,7 +479,7 @@ function createCompradorCuentaRouter({ pool }) {
 	});
 
 	// Eliminar (desactivar) cuenta del usuario autenticado
-	router.delete("/comprador/cuenta", async (req, res) => {
+	router.delete("/:perfil(comprador|usuario)/cuenta", async (req, res) => {
 		const idUsuario = await requireActiveSession(req, res);
 		if (!idUsuario) return;
 

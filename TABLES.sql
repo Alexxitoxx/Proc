@@ -2,9 +2,10 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
+
 -- =========================
 -- TABLA ROLES
--- =========================
+-- =========================  
 DROP TABLE IF EXISTS roles CASCADE;
 CREATE TABLE roles (
     id SERIAL PRIMARY KEY,
@@ -68,7 +69,7 @@ CREATE TABLE metodos_pago (
     proveedor_pago VARCHAR(100),
     token_pasarela TEXT,
     ultimos_cuatro VARCHAR(4),
-    fecha_expiracion VARCHAR(5),
+    fecha_expiracion VARCHAR(5) CHECK (fecha_expiracion ~ '^(0[1-9]|1[0-2])\/([0-9]{2})$'),
     FOREIGN KEY (id_usuario) REFERENCES usuarios(id) ON DELETE CASCADE
 );
 
@@ -93,11 +94,23 @@ CREATE TABLE negocios (
 DROP TABLE IF EXISTS categorias CASCADE;
 CREATE TABLE categorias (
     id SERIAL PRIMARY KEY,
-    nombre_categoria VARCHAR(120) NOT NULL,
+    nombre_categoria VARCHAR(100) NOT NULL,
+    id_padre INT REFERENCES categorias(id), -- Aquí sucede la magia
+    tipo VARCHAR(20) CHECK (tipo IN ('producto', 'servicio', 'ambos')),
     descripcion TEXT,
-    icon_url TEXT NULL,
-    tipo VARCHAR(20) NOT NULL CHECK (tipo IN ('producto', 'servicio', 'ambos')),
-    UNIQUE (nombre_categoria, tipo) 
+    UNIQUE (nombre_categoria, id_padre)
+);
+
+-- =========================
+-- DESCUENTOS
+-- =========================
+DROP TABLE IF EXISTS descuentos CASCADE;
+CREATE TABLE descuentos (
+    id SERIAL PRIMARY KEY,
+    codigo_cupon VARCHAR(50) UNIQUE,
+    porcentaje_descuento DECIMAL(5,2) CHECK (porcentaje_descuento BETWEEN 0 AND 100),
+    fecha_inicio TIMESTAMP,
+    fecha_fin TIMESTAMP
 );
 
 -- =========================
@@ -116,9 +129,11 @@ CREATE TABLE productos (
     sku VARCHAR(100) UNIQUE,
     esta_activo BOOLEAN DEFAULT TRUE,
     fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    id_descuento INT REFERENCES descuentos(id) ON DELETE SET null,
     embedding_vector vector(1536) 
-    -- NECESITA RELACION A TABLA IMAGENES
 );
+
+
 
 -- =========================
 -- TABLA MANEJO DE LOTES
@@ -160,6 +175,7 @@ CREATE TABLE servicios (
     calificacion DECIMAL (2,1),
     esta_activo BOOLEAN DEFAULT TRUE,
     fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    id_descuento INT REFERENCES descuentos(id) ON DELETE SET null,
     FOREIGN KEY (id_negocio) REFERENCES negocios(id) ON DELETE CASCADE
 );
 
@@ -242,32 +258,6 @@ CREATE TABLE detalle_pedido (
     )
 );
 
--- =========================
--- DESCUENTOS
--- =========================
-DROP TABLE IF EXISTS descuentos CASCADE;
-CREATE TABLE descuentos (
-    id SERIAL PRIMARY KEY,
-    codigo_cupon VARCHAR(50) UNIQUE,
-    porcentaje_descuento DECIMAL(5,2) CHECK (porcentaje_descuento BETWEEN 0 AND 100),
-    fecha_inicio TIMESTAMP,
-    fecha_fin TIMESTAMP
-);
-
--- =========================
--- RELACION PRODUCTO DESCUENTO
--- =========================
-DROP TABLE IF EXISTS rel_descuento_items CASCADE;
-CREATE TABLE rel_descuento_items (
-    id SERIAL PRIMARY KEY, 
-    id_descuento INT NOT NULL REFERENCES descuentos(id) ON DELETE CASCADE,
-    id_producto INT REFERENCES productos(id) ON DELETE CASCADE,
-    id_servicio INT REFERENCES servicios(id) ON DELETE CASCADE,
-    CONSTRAINT check_descuento_target CHECK (
-        (id_producto IS NOT NULL AND id_servicio IS NULL) OR 
-        (id_producto IS NULL AND id_servicio IS NOT NULL)
-    )
-);
 
 -- =========================
 -- TABLA LISTAS DE DESEOS
@@ -386,220 +376,6 @@ EXCLUDE USING gist (
     tsrange(fecha_hora_inicio, fecha_hora_fin) WITH &&
 );
 
-
-
-
--- =========================
--- FUNCIONES Y TRIGGERS
--- =========================
-CREATE OR REPLACE FUNCTION trg_actualizar_calificacion() 
-RETURNS TRIGGER AS $$
-BEGIN
-    -- Actualizar producto si la reseña es de un producto
-    IF COALESCE(NEW.id_producto, OLD.id_producto) IS NOT NULL THEN
-        UPDATE productos
-        SET calificacion = (
-            SELECT ROUND(AVG(calificacion)::numeric, 1)
-            FROM resenas 
-            WHERE id_producto = COALESCE(NEW.id_producto, OLD.id_producto)
-        )
-        WHERE id = COALESCE(NEW.id_producto, OLD.id_producto);
-    END IF;
-
-    -- Actualizar servicio si la reseña es de un servicio
-    IF COALESCE(NEW.id_servicio, OLD.id_servicio) IS NOT NULL THEN
-        UPDATE servicios
-        SET calificacion = (
-            SELECT ROUND(AVG(calificacion)::numeric, 1)
-            FROM resenas 
-            WHERE id_servicio = COALESCE(NEW.id_servicio, OLD.id_servicio)
-        )
-        WHERE id = COALESCE(NEW.id_servicio, OLD.id_servicio);
-    END IF;
-    
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS tg_actualizar_calificacion ON resenas;
-CREATE TRIGGER tg_actualizar_calificacion
-AFTER INSERT OR UPDATE OR DELETE ON resenas
-FOR EACH ROW EXECUTE FUNCTION trg_actualizar_calificacion();
-
-
--- La función del trigger
-CREATE OR REPLACE FUNCTION trg_llenar_snapshot_detalle() 
-RETURNS TRIGGER AS $$
-DECLARE
-    v_nombre VARCHAR;
-    v_imagen TEXT;
-    v_precio DECIMAL;
-BEGIN
-    IF NEW.id_producto IS NOT NULL THEN
-        SELECT p.nombre, p.precio, pi.url_imagen INTO v_nombre, v_precio, v_imagen
-        FROM productos p
-        LEFT JOIN producto_imagenes pi ON p.id = pi.id_producto AND pi.es_principal = TRUE
-        WHERE p.id = NEW.id_producto;
-
-        NEW.precio_unitario_historico := COALESCE(v_precio, 0);
-        NEW.snapshot_item := jsonb_build_object('nombre', v_nombre, 'imagen_principal', v_imagen);
-        
-    ELSIF NEW.id_servicio IS NOT NULL THEN
-        SELECT s.nombre, s.precio_base, si.url_imagen INTO v_nombre, v_precio, v_imagen
-        FROM servicios s
-        LEFT JOIN servicio_imagenes si ON s.id = si.id_servicio AND si.es_principal = TRUE
-        WHERE s.id = NEW.id_servicio;
-
-        NEW.precio_unitario_historico := COALESCE(v_precio, 0);
-        NEW.snapshot_item := jsonb_build_object('nombre', v_nombre, 'imagen_principal', v_imagen);
-    END IF;
-    
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS tg_snapshot_detalle ON detalle_pedido;
-CREATE TRIGGER tg_snapshot_detalle
-BEFORE INSERT ON detalle_pedido
-FOR EACH ROW EXECUTE FUNCTION trg_llenar_snapshot_detalle();
-
-
-CREATE OR REPLACE FUNCTION trg_sync_stock_producto() 
-RETURNS TRIGGER AS $$
-BEGIN
-    UPDATE productos
-    SET stock_total = (
-        SELECT COALESCE(SUM(stock_disponible), 0)
-        FROM lotes_inventario
-        WHERE id_producto = COALESCE(NEW.id_producto, OLD.id_producto)
-          AND fecha_caducidad >= CURRENT_DATE -- ESTO ES LO QUE FALTABA
-    )
-    WHERE id = COALESCE(NEW.id_producto, OLD.id_producto);
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS tg_sync_stock ON lotes_inventario;
-CREATE TRIGGER tg_sync_stock
-AFTER INSERT OR UPDATE OR DELETE ON lotes_inventario
-FOR EACH ROW EXECUTE FUNCTION trg_sync_stock_producto();
-
-
-CREATE OR REPLACE FUNCTION procesar_checkout(
-    p_id_usuario INT,
-    p_direccion_snapshot JSONB,
-    p_metodo_pago_snapshot JSONB
-) RETURNS INT AS $$
-DECLARE
-    v_id_carrito INT;
-    v_id_pedido INT;
-    v_total DECIMAL(10,2) := 0;
-    v_item RECORD;
-    v_lote RECORD;
-    v_cantidad_restante INT;
-    v_precio_item DECIMAL(12,2);
-BEGIN
-    -- 1. Validar existencia del carrito
-    SELECT id INTO v_id_carrito FROM carrito WHERE id_usuario = p_id_usuario;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'El usuario % no tiene un carrito activo.', p_id_usuario;
-    END IF;
-
-    -- 2. Crear el pedido inicial (total 0 por ahora, estado PENDIENTE)
-    INSERT INTO pedidos (id_usuario, total, estado_pedido, direccion_envio_snapshot, metodo_pago_snapshot)
-    VALUES (p_id_usuario, 0, 'PENDIENTE', p_direccion_snapshot, p_metodo_pago_snapshot)
-    RETURNING id INTO v_id_pedido;
-
-    -- 3. Iterar sobre cada item en el carrito
-    FOR v_item IN (SELECT * FROM carrito_items WHERE id_carrito = v_id_carrito) LOOP
-        
-        -- RAMA A: Es un Producto
-        IF v_item.id_producto IS NOT NULL THEN
-            -- Bloqueamos el producto temporalmente para asegurar la lectura del precio
-            SELECT precio INTO v_precio_item FROM productos WHERE id = v_item.id_producto FOR SHARE;
-            
-            v_cantidad_restante := v_item.cantidad;
-            
-            -- Verificar si hay stock total válido (no caducado) ANTES de iterar
-            IF (SELECT COALESCE(SUM(stock_disponible), 0) 
-                FROM lotes_inventario 
-                WHERE id_producto = v_item.id_producto 
-                AND fecha_caducidad >= CURRENT_DATE) < v_cantidad_restante THEN
-                RAISE EXCEPTION 'Stock insuficiente o caducado para el producto ID %', v_item.id_producto;
-            END IF;
-
-            -- Lógica FIFO: Descontar de los lotes más próximos a caducar
-            FOR v_lote IN (
-                SELECT id, stock_disponible 
-                FROM lotes_inventario 
-                WHERE id_producto = v_item.id_producto 
-                  AND fecha_caducidad >= CURRENT_DATE 
-                  AND stock_disponible > 0
-                ORDER BY fecha_caducidad ASC
-                FOR UPDATE -- ESTO ES CRÍTICO: Bloquea la fila del lote contra compras simultáneas
-            ) LOOP
-                IF v_cantidad_restante = 0 THEN
-                    EXIT; -- Ya cubrimos la cantidad requerida
-                END IF;
-
-                IF v_lote.stock_disponible >= v_cantidad_restante THEN
-                    UPDATE lotes_inventario 
-                    SET stock_disponible = stock_disponible - v_cantidad_restante 
-                    WHERE id = v_lote.id;
-                    v_cantidad_restante := 0;
-                ELSE
-                    UPDATE lotes_inventario 
-                    SET stock_disponible = 0 
-                    WHERE id = v_lote.id;
-                    v_cantidad_restante := v_cantidad_restante - v_lote.stock_disponible;
-                END IF;
-            END LOOP;
-
-            -- Insertar el detalle. 
-            -- (Nota: El trigger trg_llenar_snapshot_detalle que creamos antes interceptará esto 
-            -- y le inyectará el JSON con el nombre y la foto al vuelo).
-            INSERT INTO detalle_pedido (id_pedido, id_producto, cantidad, precio_unitario_historico)
-            VALUES (v_id_pedido, v_item.id_producto, v_item.cantidad, v_precio_item);
-            
-            v_total := v_total + (v_precio_item * v_item.cantidad);
-
-        -- RAMA B: Es un Servicio
-        ELSIF v_item.id_servicio IS NOT NULL THEN
-            SELECT precio_base INTO v_precio_item FROM servicios WHERE id = v_item.id_servicio FOR SHARE;
-            
-            INSERT INTO detalle_pedido (id_pedido, id_servicio, cantidad, precio_unitario_historico, id_agenda_seleccionada)
-            VALUES (v_id_pedido, v_item.id_servicio, v_item.cantidad, v_precio_item, v_item.id_agenda_seleccionada);
-            
-            v_total := v_total + (v_precio_item * v_item.cantidad);
-        END IF;
-    END LOOP;
-
-    -- Validar que el carrito no estuviera vacío
-    IF v_total = 0 THEN
-        RAISE EXCEPTION 'El carrito está vacío. No se puede generar un pedido.';
-    END IF;
-
-    -- 4. Actualizar el costo total real del pedido
-    UPDATE pedidos SET total = v_total WHERE id = v_id_pedido;
-
-    -- 5. Vaciar el carrito (Solo borramos los items, conservamos el ID del carrito para el usuario)
-    DELETE FROM carrito_items WHERE id_carrito = v_id_carrito;
-
-    -- Devolvemos el ID del pedido creado al backend
-    RETURN v_id_pedido;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION purgar_lotes_caducados() 
-RETURNS VOID AS $$
-BEGIN
-    -- Poner a 0 el stock de la mercancía caducada.
-    -- Al hacer este UPDATE, PostgreSQL disparará automáticamente 
-    -- el trigger trg_sync_stock_producto() para recalcular los totales.
-    UPDATE lotes_inventario
-    SET stock_disponible = 0
-    WHERE fecha_caducidad < CURRENT_DATE 
-      AND stock_disponible > 0;
-END;
-$$ LANGUAGE plpgsql;
+CREATE INDEX idx_productos_descuento ON productos(id_descuento) WHERE id_descuento IS NOT NULL;
+CREATE INDEX idx_servicios_descuento ON servicios(id_descuento) WHERE id_descuento IS NOT NULL;
 
