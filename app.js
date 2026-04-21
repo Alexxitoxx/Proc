@@ -11,6 +11,7 @@ const createCompradorCuentaRouter = require("./Usuario/cuenta");
 const createUsuarioWishlistRouter = require("./Usuario/wishlist");
 const createCompradorCarritoRouter = require("./Comprador/carrito");
 const createCompradorPedidosRouter = require("./Comprador/pedidos");
+const createIARouter = require("./IA/routes");
 
 
 const app = express();
@@ -78,6 +79,10 @@ app.use(
   createCompradorPedidosRouter({
     pool,
   })
+);
+
+app.use(
+  createIARouter()
 );
 
 app.use(
