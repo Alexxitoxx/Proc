@@ -6,11 +6,13 @@ const createAdminRouter = require("./Admin/routes");
 const createVendedorRouter = require("./Vendedor/CRUD");
 const createVendedorOrdersRouter = require("./Vendedor/Pedidos");
 const createVendedorBusinessRouter = require("./Vendedor/Negocio");
+const createVendedorDescuentosRouter = require("./Vendedor/Descuentos");
 const createCompradorRouter = require("./Comprador/productos");
 const createCompradorCuentaRouter = require("./Usuario/cuenta");
 const createUsuarioWishlistRouter = require("./Usuario/wishlist");
 const createCompradorCarritoRouter = require("./Comprador/carrito");
 const createCompradorPedidosRouter = require("./Comprador/pedidos");
+const createCompradorDescuentosRouter = require("./Comprador/Descuentos");
 const createIARouter = require("./IA/routes");
 
 
@@ -82,6 +84,12 @@ app.use(
 );
 
 app.use(
+  createCompradorDescuentosRouter({
+    pool,
+  })
+);
+
+app.use(
   createIARouter()
 );
 
@@ -99,6 +107,12 @@ app.use(
 
 app.use(
   createVendedorBusinessRouter({
+    pool,
+  })
+);
+
+app.use(
+  createVendedorDescuentosRouter({
     pool,
   })
 );

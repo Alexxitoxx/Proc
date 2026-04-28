@@ -107,6 +107,7 @@ CREATE TABLE categorias (
 DROP TABLE IF EXISTS descuentos CASCADE;
 CREATE TABLE descuentos (
     id SERIAL PRIMARY KEY,
+    id_negocio INT NOT NULL REFERENCES negocios(id) ON DELETE CASCADE,
     codigo_cupon VARCHAR(50) UNIQUE,
     porcentaje_descuento DECIMAL(5,2) CHECK (porcentaje_descuento BETWEEN 0 AND 100),
     fecha_inicio TIMESTAMP,
