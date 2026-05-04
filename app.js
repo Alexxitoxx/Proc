@@ -3,6 +3,7 @@ const session = require("express-session");
 const { Pool } = require("pg");
 const createLoginRouter = require("./Login/APIs");
 const createAdminRouter = require("./Admin/routes");
+const createAdminReportesRouter = require("./Admin/reportes");
 const createVendedorRouter = require("./Vendedor/CRUD");
 const createVendedorOrdersRouter = require("./Vendedor/Pedidos");
 const createVendedorBusinessRouter = require("./Vendedor/Negocio");
@@ -12,6 +13,7 @@ const createCompradorCuentaRouter = require("./Usuario/cuenta");
 const createUsuarioWishlistRouter = require("./Usuario/wishlist");
 const createCompradorCarritoRouter = require("./Comprador/carrito");
 const createCompradorPedidosRouter = require("./Comprador/pedidos");
+const createCompradorReportesRouter = require("./Comprador/reportes");
 const createCompradorDescuentosRouter = require("./Comprador/Descuentos");
 const createIARouter = require("./IA/routes");
 
@@ -54,6 +56,12 @@ app.use(
 );
 
 app.use(
+  createAdminReportesRouter({
+    pool,
+  })
+);
+
+app.use(
   createCompradorRouter({
     pool,
   })
@@ -79,6 +87,12 @@ app.use(
 
 app.use(
   createCompradorPedidosRouter({
+    pool,
+  })
+);
+
+app.use(
+  createCompradorReportesRouter({
     pool,
   })
 );

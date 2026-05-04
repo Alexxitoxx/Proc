@@ -1,0 +1,266 @@
+const express = require("express");
+
+function createCompradorReportesRouter({ pool }) {
+	const router = express.Router();
+
+	// Obtiene el id del usuario guardado en la sesion.
+	function obtenerUsuarioSesion(req) {
+		return Number(req.session?.usuario_id || 0);
+	}
+
+	// Valida que exista sesion activa y que el usuario siga habilitado en la base.
+	async function requireActiveSession(req, res) {
+		const idUsuario = obtenerUsuarioSesion(req);
+		if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
+			res.status(401).json({ mensaje: "Debes iniciar sesion" });
+			return null;
+		}
+
+		try {
+			const result = await pool.query(
+				`SELECT id
+				 FROM usuarios
+				 WHERE id = $1
+					 AND activo = TRUE
+					 AND fecha_eliminacion IS NULL
+				 LIMIT 1`,
+				[idUsuario]
+			);
+
+			if (result.rows.length === 0) {
+				res.status(401).json({ mensaje: "Sesion invalida o usuario inactivo" });
+				return null;
+			}
+
+			return idUsuario;
+		} catch (error) {
+			console.error(error);
+			res.status(500).json({ mensaje: "Error al validar sesion" });
+			return null;
+		}
+	}
+
+	// Busca el negocio dueño de un producto para amarrar el reporte al contexto correcto.
+	async function obtenerNegocioPorProducto(idProducto) {
+		const result = await pool.query(
+			`SELECT id, id_negocio
+			 FROM productos
+			 WHERE id = $1
+			 LIMIT 1`,
+			[idProducto]
+		);
+
+		return result.rows[0] || null;
+	}
+
+	// Busca el negocio dueño de un servicio para relacionarlo con el reporte.
+	async function obtenerNegocioPorServicio(idServicio) {
+		const result = await pool.query(
+			`SELECT id, id_negocio
+			 FROM servicios
+			 WHERE id = $1
+			 LIMIT 1`,
+			[idServicio]
+		);
+
+		return result.rows[0] || null;
+	}
+
+	// Crea un reporte nuevo desde la vista del comprador.
+	// Solo permite reportar un producto o un servicio por solicitud.
+	router.post("/comprador/reportes", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		const { id_producto, id_servicio, motivo, descripcion } = req.body;
+		const productoId = Number(id_producto);
+		const servicioId = Number(id_servicio);
+		const tieneProducto = Number.isInteger(productoId) && productoId > 0;
+		const tieneServicio = Number.isInteger(servicioId) && servicioId > 0;
+
+		if (tieneProducto === tieneServicio) {
+			return res.status(400).json({
+				mensaje: "Debes enviar solo id_producto o solo id_servicio",
+			});
+		}
+
+		if (!motivo || !descripcion) {
+			return res.status(400).json({
+				mensaje: "Motivo y descripcion son obligatorios",
+			});
+		}
+
+		try {
+			let idNegocio = null;
+			let tipoObjetivo = null;
+
+			if (tieneProducto) {
+				const producto = await obtenerNegocioPorProducto(productoId);
+				if (!producto) {
+					return res.status(404).json({ mensaje: "Producto no encontrado" });
+				}
+
+				idNegocio = producto.id_negocio;
+				tipoObjetivo = "producto";
+			} else {
+				const servicio = await obtenerNegocioPorServicio(servicioId);
+				if (!servicio) {
+					return res.status(404).json({ mensaje: "Servicio no encontrado" });
+				}
+
+				idNegocio = servicio.id_negocio;
+				tipoObjetivo = "servicio";
+			}
+
+			const inserted = await pool.query(
+				`INSERT INTO reportes (
+					 id_usuario,
+					 id_negocio,
+					 id_producto,
+					 id_servicio,
+					 motivo,
+					 descripcion,
+					 estado_reporte
+				 )
+				 VALUES ($1, $2, $3, $4, $5, $6, 'PENDIENTE')
+				 RETURNING id, id_usuario, id_negocio, id_producto, id_servicio, motivo, descripcion, estado_reporte, fecha_creacion, fecha_resolucion`,
+				[
+					idUsuario,
+					idNegocio,
+					tieneProducto ? productoId : null,
+					tieneServicio ? servicioId : null,
+					String(motivo).trim(),
+					String(descripcion).trim(),
+				]
+			);
+
+			return res.status(201).json({
+				mensaje: "Reporte creado",
+				reporte: {
+					...inserted.rows[0],
+					tipo_objetivo: tipoObjetivo,
+				},
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al crear reporte" });
+		}
+	});
+
+	// Devuelve todos los reportes creados por el comprador autenticado.
+	router.get("/comprador/reportes", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		try {
+			const result = await pool.query(
+				`SELECT
+					 r.id,
+					 r.id_usuario,
+					 r.id_negocio,
+					 r.id_producto,
+					 r.id_servicio,
+					 r.motivo,
+					 r.descripcion,
+					 r.estado_reporte,
+					 r.fecha_creacion,
+					 r.fecha_resolucion,
+					 p.nombre AS nombre_producto,
+					 s.nombre AS nombre_servicio,
+					 n.nombre_comercial
+				 FROM reportes r
+				 LEFT JOIN productos p ON p.id = r.id_producto
+				 LEFT JOIN servicios s ON s.id = r.id_servicio
+				 INNER JOIN negocios n ON n.id = r.id_negocio
+				 WHERE r.id_usuario = $1
+				 ORDER BY r.fecha_creacion DESC, r.id DESC`,
+				[idUsuario]
+			);
+
+			return res.status(200).json(
+				result.rows.map((reporte) => ({
+					id: reporte.id,
+					id_usuario: reporte.id_usuario,
+					id_negocio: reporte.id_negocio,
+					negocio: reporte.nombre_comercial,
+					motivo: reporte.motivo,
+					descripcion: reporte.descripcion,
+					estado_reporte: reporte.estado_reporte,
+					fecha_creacion: reporte.fecha_creacion,
+					fecha_resolucion: reporte.fecha_resolucion,
+					tipo_objetivo: reporte.id_producto ? "producto" : "servicio",
+					id_objetivo: reporte.id_producto || reporte.id_servicio,
+					nombre_objetivo: reporte.nombre_producto || reporte.nombre_servicio,
+				}))
+			);
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al obtener reportes" });
+		}
+	});
+
+	// Devuelve el detalle de un reporte específico del comprador autenticado.
+	router.get("/comprador/reportes/:idReporte", async (req, res) => {
+		const idUsuario = await requireActiveSession(req, res);
+		if (!idUsuario) return;
+
+		const idReporte = Number(req.params.idReporte);
+		if (!Number.isInteger(idReporte) || idReporte <= 0) {
+			return res.status(400).json({ mensaje: "idReporte invalido" });
+		}
+
+		try {
+			const result = await pool.query(
+				`SELECT
+					 r.id,
+					 r.id_usuario,
+					 r.id_negocio,
+					 r.id_producto,
+					 r.id_servicio,
+					 r.motivo,
+					 r.descripcion,
+					 r.estado_reporte,
+					 r.fecha_creacion,
+					 r.fecha_resolucion,
+					 p.nombre AS nombre_producto,
+					 s.nombre AS nombre_servicio,
+					 n.nombre_comercial
+				 FROM reportes r
+				 LEFT JOIN productos p ON p.id = r.id_producto
+				 LEFT JOIN servicios s ON s.id = r.id_servicio
+				 INNER JOIN negocios n ON n.id = r.id_negocio
+				 WHERE r.id = $1
+					 AND r.id_usuario = $2
+				 LIMIT 1`,
+				[idReporte, idUsuario]
+			);
+
+			if (result.rows.length === 0) {
+				return res.status(404).json({ mensaje: "Reporte no encontrado" });
+			}
+
+			const reporte = result.rows[0];
+			return res.status(200).json({
+				id: reporte.id,
+				id_usuario: reporte.id_usuario,
+				id_negocio: reporte.id_negocio,
+				negocio: reporte.nombre_comercial,
+				motivo: reporte.motivo,
+				descripcion: reporte.descripcion,
+				estado_reporte: reporte.estado_reporte,
+				fecha_creacion: reporte.fecha_creacion,
+				fecha_resolucion: reporte.fecha_resolucion,
+				tipo_objetivo: reporte.id_producto ? "producto" : "servicio",
+				id_objetivo: reporte.id_producto || reporte.id_servicio,
+				nombre_objetivo: reporte.nombre_producto || reporte.nombre_servicio,
+			});
+		} catch (error) {
+			console.error(error);
+			return res.status(500).json({ mensaje: "Error al obtener reporte" });
+		}
+	});
+
+	return router;
+}
+
+module.exports = createCompradorReportesRouter;

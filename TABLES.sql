@@ -107,7 +107,6 @@ CREATE TABLE categorias (
 DROP TABLE IF EXISTS descuentos CASCADE;
 CREATE TABLE descuentos (
     id SERIAL PRIMARY KEY,
-    id_negocio INT NOT NULL REFERENCES negocios(id) ON DELETE CASCADE,
     codigo_cupon VARCHAR(50) UNIQUE,
     porcentaje_descuento DECIMAL(5,2) CHECK (porcentaje_descuento BETWEEN 0 AND 100),
     fecha_inicio TIMESTAMP,
@@ -334,12 +333,38 @@ CREATE TABLE servicio_categoria (
     FOREIGN KEY (id_categoria) REFERENCES categorias(id) ON DELETE CASCADE
 );
 
+-- =========================
+-- TABLA REPORTES
+-- =========================
+DROP TABLE IF EXISTS reportes CASCADE;
+CREATE TABLE reportes (
+    id SERIAL PRIMARY KEY,
+    id_usuario INT NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    id_negocio INT NOT NULL REFERENCES negocios(id) ON DELETE CASCADE,
+    id_producto INT REFERENCES productos(id) ON DELETE CASCADE,
+    id_servicio INT REFERENCES servicios(id) ON DELETE CASCADE,
+    motivo VARCHAR(150) NOT NULL,
+    descripcion TEXT NOT NULL,
+    estado_reporte VARCHAR(50) DEFAULT 'PENDIENTE',
+    fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    fecha_resolucion TIMESTAMP NULL,
+    -- Restricción para asegurar que el reporte se asocie a un producto o a un servicio, pero no a ambos a la vez
+    CONSTRAINT check_reporte_target CHECK (
+        (id_producto IS NOT NULL AND id_servicio IS NULL) OR 
+        (id_producto IS NULL AND id_servicio IS NOT NULL)
+    )
+);
+
 CREATE INDEX idx_interacciones_usuario ON interacciones_usuario(id_usuario, tipo_accion);
 CREATE INDEX idx_interacciones_producto ON interacciones_usuario(id_producto);
 
 CREATE UNIQUE INDEX idx_unique_resena_producto ON resenas(id_usuario, id_producto) WHERE id_producto IS NOT NULL;
 CREATE UNIQUE INDEX idx_unique_resena_servicio ON resenas(id_usuario, id_servicio) WHERE id_servicio IS NOT NULL;
 
+-- Índices para optimizar búsquedas frecuentes
+CREATE INDEX idx_reportes_usuario ON reportes(id_usuario);
+CREATE INDEX idx_reportes_negocio ON reportes(id_negocio);
+CREATE INDEX idx_reportes_estado ON reportes(estado_reporte);
 
 -- Galería de Productos
 DROP TABLE IF EXISTS producto_imagenes CASCADE;
