@@ -1,6 +1,6 @@
 import math
 import time
-import re
+import requests
 from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime
@@ -11,6 +11,20 @@ from models_V2 import (
 )
 from extractor_entidades_V2 import ExtractorEntidades, EntidadesPrompt
 
+def _generar_vector_usuario(self, prompt: str):
+    """Llama a tu Ollama local para vectorizar la pregunta."""
+    url = "http://localhost:11434/api/embeddings"
+    try:
+        response = requests.post(url, json={
+            "model": "nomic-embed-text",
+            "prompt": prompt
+        })
+        return response.json()["embedding"]
+    except Exception as e:
+        print(f"Error vectorizando prompt: {e}")
+        return None
+    
+    
 REGLAS_CANTIDAD = {
     # Mobiliario (renta — 1 por persona)
     "silla":           {"factor": 1.0,  "modo": "personas",  "razon": "1 silla por persona"},

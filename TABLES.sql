@@ -176,6 +176,7 @@ CREATE TABLE servicios (
     esta_activo BOOLEAN DEFAULT TRUE,
     fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     id_descuento INT REFERENCES descuentos(id) ON DELETE SET null,
+    embedding_vector vector(1536),
     FOREIGN KEY (id_negocio) REFERENCES negocios(id) ON DELETE CASCADE
 );
 
