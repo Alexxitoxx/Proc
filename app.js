@@ -19,6 +19,9 @@ const createIARouter = require("./IA/routes");
 
 
 const app = express();
+app.set("trust proxy", 1);
+
+const isProduction = String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
 // Configuración
 app.use(express.json());
@@ -30,6 +33,11 @@ app.use(
     secret: "clave_super_secreta",
     resave: false,
     saveUninitialized: true,
+    cookie: {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: "lax",
+    },
   })
 );
 

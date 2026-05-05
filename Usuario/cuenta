@@ -9,7 +9,38 @@ function createCompradorCuentaRouter({ pool }) {
 	}
 
 	function hashPassword(password) {
-		return crypto.createHash("sha256").update(String(password)).digest("hex");
+		const salt = crypto.randomBytes(16).toString("hex");
+		const derivedKey = crypto.scryptSync(String(password), salt, 64).toString("hex");
+		return `scrypt$${salt}$${derivedKey}`;
+	}
+
+	function verifyPassword(password, storedHash) {
+		const passwordText = String(password);
+		const storedText = String(storedHash || "");
+
+		if (storedText.startsWith("scrypt$")) {
+			const parts = storedText.split("$");
+			if (parts.length !== 3) {
+				return false;
+			}
+
+			const salt = parts[1];
+			const expectedHash = Buffer.from(parts[2], "hex");
+			const actualHash = crypto.scryptSync(passwordText, salt, expectedHash.length);
+
+			if (expectedHash.length !== actualHash.length) {
+				return false;
+			}
+
+			return crypto.timingSafeEqual(expectedHash, actualHash);
+		}
+
+		if (/^[a-f0-9]{64}$/i.test(storedText)) {
+			const legacyHash = crypto.createHash("sha256").update(passwordText).digest("hex");
+			return legacyHash === storedText;
+		}
+
+		return false;
 	}
 
 	function requireSession(req, res) {
@@ -457,10 +488,9 @@ function createCompradorCuentaRouter({ pool }) {
 				return res.status(404).json({ mensaje: "Usuario no encontrado" });
 			}
 
-			const hashActual = hashPassword(password_actual);
 			const hashGuardado = usuario.rows[0].password_hash;
 
-			if (hashActual !== hashGuardado) {
+			if (!verifyPassword(password_actual, hashGuardado)) {
 				return res.status(401).json({ mensaje: "La password actual es incorrecta" });
 			}
 
@@ -502,8 +532,7 @@ function createCompradorCuentaRouter({ pool }) {
 				return res.status(400).json({ mensaje: "La cuenta ya esta desactivada" });
 			}
 
-			const hashActual = hashPassword(password_actual);
-			if (hashActual !== usuario.rows[0].password_hash) {
+			if (!verifyPassword(password_actual, usuario.rows[0].password_hash)) {
 				return res.status(401).json({ mensaje: "La password actual es incorrecta" });
 			}
 

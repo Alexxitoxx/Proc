@@ -8,7 +8,33 @@ const ROLE_NAMES_BY_ID = {
 };
 
 function hashPassword(password) {
-  return crypto.createHash("sha256").update(String(password)).digest("hex");
+  const salt = crypto.randomBytes(16).toString("hex");
+  const derivedKey = crypto.scryptSync(String(password), salt, 64).toString("hex");
+  return `scrypt$${salt}$${derivedKey}`;
+}
+
+function verifyPassword(password, storedHash) {
+  const passwordText = String(password);
+  const storedText = String(storedHash || "");
+
+  if (storedText.startsWith("scrypt$")) {
+    const parts = storedText.split("$");
+    if (parts.length !== 3) {
+      return false;
+    }
+
+    const salt = parts[1];
+    const expectedHash = Buffer.from(parts[2], "hex");
+    const actualHash = crypto.scryptSync(passwordText, salt, expectedHash.length);
+
+    if (expectedHash.length !== actualHash.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(expectedHash, actualHash);
+  }
+
+  return false;
 }
 
 function normalizeRoleId(rawRole) {
@@ -81,9 +107,9 @@ function createLoginRouter({ pool }) {
         return res.status(403).json({ mensaje: "Cuenta inactiva, contacte al administrador" });
       }
 
-      const hashIngresado = hashPassword(passwordPlano);
+      const passwordValido = verifyPassword(passwordPlano, usuario.password_hash);
 
-      if (hashIngresado !== usuario.password_hash) {
+      if (!passwordValido) {
         return res.status(401).json({ mensaje: "Contraseña incorrecta" });
       }
 
