@@ -1,4 +1,5 @@
 const express = require("express");
+const { enviarCorreo } = require("../Admin/mail");
 
 function createCompradorReportesRouter({ pool }) {
 	const router = express.Router();
@@ -61,6 +62,39 @@ function createCompradorReportesRouter({ pool }) {
 			 WHERE id = $1
 			 LIMIT 1`,
 			[idServicio]
+		);
+
+		return result.rows[0] || null;
+	}
+
+	async function obtenerContextoReporte(idReporte) {
+		const result = await pool.query(
+			`SELECT
+				r.id,
+				r.id_usuario AS id_reportador,
+				rep.nombre AS nombre_reportador,
+				rep.email AS email_reportador,
+				r.id_negocio,
+				n.nombre_comercial,
+				nu.id AS id_reportado,
+				nu.nombre AS nombre_reportado,
+				nu.email AS email_reportado,
+				r.id_producto,
+				r.id_servicio,
+				p.nombre AS nombre_producto,
+				s.nombre AS nombre_servicio,
+				r.motivo,
+				r.descripcion,
+				r.estado_reporte
+			 FROM reportes r
+			 INNER JOIN usuarios rep ON rep.id = r.id_usuario
+			 INNER JOIN negocios n ON n.id = r.id_negocio
+			 INNER JOIN usuarios nu ON nu.id = n.id_usuario
+			 LEFT JOIN productos p ON p.id = r.id_producto
+			 LEFT JOIN servicios s ON s.id = r.id_servicio
+			 WHERE r.id = $1
+			 LIMIT 1`,
+			[idReporte]
 		);
 
 		return result.rows[0] || null;
@@ -133,6 +167,20 @@ function createCompradorReportesRouter({ pool }) {
 					String(descripcion).trim(),
 				]
 			);
+
+			const contextoReporte = await obtenerContextoReporte(inserted.rows[0].id);
+			if (contextoReporte?.email_reportado) {
+				try {
+					await enviarCorreo({
+						to: contextoReporte.email_reportado,
+						subject: `Has recibido un reporte #${contextoReporte.id}`,
+						text: `Se ha creado un reporte sobre tu contenido o negocio.\n\nNegocio: ${contextoReporte.nombre_comercial}\nObjetivo: ${contextoReporte.nombre_producto || contextoReporte.nombre_servicio || "N/D"}\nMotivo: ${String(motivo).trim()}\nDescripcion: ${String(descripcion).trim()}\nEstado: PENDIENTE`,
+						html: `<p>Se ha creado un reporte sobre tu contenido o negocio.</p><p><strong>Negocio:</strong> ${contextoReporte.nombre_comercial}</p><p><strong>Objetivo:</strong> ${contextoReporte.nombre_producto || contextoReporte.nombre_servicio || "N/D"}</p><p><strong>Motivo:</strong> ${String(motivo).trim()}</p><p><strong>Descripcion:</strong> ${String(descripcion).trim()}</p><p><strong>Estado:</strong> PENDIENTE</p>`,
+					});
+				} catch (mailError) {
+					console.error("No se pudo notificar al reportado:", mailError);
+				}
+			}
 
 			return res.status(201).json({
 				mensaje: "Reporte creado",

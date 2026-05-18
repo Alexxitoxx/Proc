@@ -1,6 +1,7 @@
 const express = require("express");
 const crypto = require("crypto");
 
+
 const ROLE_NAMES_BY_ID = {
   1: "comprador",
   2: "vendedor",
@@ -37,31 +38,7 @@ function verifyPassword(password, storedHash) {
   return false;
 }
 
-function normalizeRoleId(rawRole) {
-  if (rawRole === undefined || rawRole === null || rawRole === "") {
-    return 1;
-  }
 
-  const normalizedText = String(rawRole).trim().toLowerCase();
-  if (["comprador", "cliente", "usuario"].includes(normalizedText)) {
-    return 1;
-  }
-
-  if (["vendedor", "seller"].includes(normalizedText)) {
-    return 2;
-  }
-
-  if (["admin", "administrador"].includes(normalizedText)) {
-    return 3;
-  }
-
-  const normalizedNumber = Number(rawRole);
-  if (Number.isInteger(normalizedNumber) && [1, 2, 3].includes(normalizedNumber)) {
-    return normalizedNumber;
-  }
-
-  return null;
-}
 
 function getRoleNameById(idRol, dbRoleName) {
   if (dbRoleName) {
@@ -137,6 +114,7 @@ function createLoginRouter({ pool }) {
   });
 
   // Registrar usuario
+
   router.post("/registrar", async (req, res) => {
     const {
       nombre_usuario,
@@ -146,25 +124,24 @@ function createLoginRouter({ pool }) {
       contrasena,
       password,
       telefono,
-      tipo_usuario,
       id_rol,
     } = req.body;
 
     const nombreFinal = (nombre || nombre_usuario || "").trim();
     const emailFinal = (email || correo || "").trim().toLowerCase();
     const passwordPlano = contrasena || password;
-    const rolSolicitado = normalizeRoleId(id_rol ?? tipo_usuario);
+    const rolSolicitado = Number(id_rol);
 
     try {
-      if (!nombreFinal || !emailFinal || !passwordPlano) {  //#Sugeto a cambios por el front
+      if (!nombreFinal || !emailFinal || !passwordPlano) {
         return res.status(400).json({
           mensaje: "Nombre, correo y contraseña son obligatorios",
         });
       }
 
-      if (rolSolicitado === null) {
+      if (![1, 2, 3].includes(rolSolicitado)) {
         return res.status(400).json({
-          mensaje: "Rol solicitado no es válido",
+          mensaje: "Rol solicitado no es válido. Debe ser 1, 2 o 3.",
         });
       }
 
@@ -184,7 +161,7 @@ function createLoginRouter({ pool }) {
          RETURNING id, nombre, email`,
         [rolSolicitado, nombreFinal, emailFinal, passwordHash, telefono || null]
       );
-      
+
       return res.status(201).json({
         mensaje: "Usuario registrado correctamente",
         usuario: creado.rows[0],

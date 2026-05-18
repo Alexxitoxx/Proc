@@ -1,4 +1,5 @@
 const express = require("express");
+const { enviarCorreo } = require("./mail");
 
 function createAdminReportesRouter({ pool }) {
   const router = express.Router();
@@ -61,6 +62,86 @@ function createAdminReportesRouter({ pool }) {
       estado_reporte: row.estado_reporte,
       fecha_creacion: row.fecha_creacion,
       fecha_resolucion: row.fecha_resolucion,
+    };
+  }
+
+  async function obtenerContextoReporte(idReporte) {
+    const result = await pool.query(
+      `SELECT
+         r.id,
+         r.id_usuario AS id_reportador,
+         rep.nombre AS nombre_reportador,
+         rep.email AS email_reportador,
+         r.id_negocio,
+         n.nombre_comercial,
+         nu.id AS id_reportado,
+         nu.nombre AS nombre_reportado,
+         nu.email AS email_reportado,
+         r.id_producto,
+         r.id_servicio,
+         p.nombre AS nombre_producto,
+         s.nombre AS nombre_servicio,
+         r.motivo,
+         r.descripcion,
+         r.estado_reporte
+       FROM reportes r
+       INNER JOIN usuarios rep ON rep.id = r.id_usuario
+       INNER JOIN negocios n ON n.id = r.id_negocio
+       INNER JOIN usuarios nu ON nu.id = n.id_usuario
+       LEFT JOIN productos p ON p.id = r.id_producto
+       LEFT JOIN servicios s ON s.id = r.id_servicio
+       WHERE r.id = $1
+       LIMIT 1`,
+      [idReporte]
+    );
+
+    return result.rows[0] || null;
+  }
+
+  async function notificarResolucionReporte(contextoReporte, detalle) {
+    const destinatarios = [...new Set([
+      contextoReporte.email_reportado,
+      contextoReporte.email_reportador,
+    ].filter(Boolean))];
+
+    if (destinatarios.length === 0) {
+      return { total: 0, enviados: 0, fallidos: [] };
+    }
+
+    const nombreObjetivo = contextoReporte.nombre_producto || contextoReporte.nombre_servicio || "N/D";
+    const asunto = `Actualizacion de tu reporte #${contextoReporte.id}`;
+    const texto = [
+      `El reporte #${contextoReporte.id} fue resuelto.`,
+      `Estado: ${contextoReporte.estado_reporte}`,
+      `Negocio: ${contextoReporte.nombre_comercial}`,
+      `Objetivo: ${nombreObjetivo}`,
+      detalle ? `Detalle: ${detalle}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const html = [
+      `<p>El reporte <strong>#${contextoReporte.id}</strong> fue resuelto.</p>`,
+      `<p><strong>Estado:</strong> ${contextoReporte.estado_reporte}</p>`,
+      `<p><strong>Negocio:</strong> ${contextoReporte.nombre_comercial}</p>`,
+      `<p><strong>Objetivo:</strong> ${nombreObjetivo}</p>`,
+      detalle ? `<p><strong>Detalle:</strong> ${detalle}</p>` : "",
+    ].join("");
+
+    const resultados = await Promise.allSettled(
+      destinatarios.map((email) => enviarCorreo({ to: email, subject: asunto, text: texto, html }))
+    );
+
+    return {
+      total: destinatarios.length,
+      enviados: resultados.filter((resultado) => resultado.status === "fulfilled").length,
+      fallidos: resultados
+        .map((resultado, index) => ({ resultado, email: destinatarios[index] }))
+        .filter(({ resultado }) => resultado.status === "rejected")
+        .map(({ email, resultado }) => ({
+          email,
+          error: String(resultado.reason?.message || resultado.reason || "Error al enviar correo"),
+        })),
     };
   }
 
@@ -151,6 +232,9 @@ function createAdminReportesRouter({ pool }) {
     if (!estado) return res.status(400).json({ status: "error", mensaje: "estado es obligatorio" });
 
     try {
+      const contextoAntes = await obtenerContextoReporte(id);
+      if (!contextoAntes) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
+
       const result = await pool.query(
         `UPDATE reportes
          SET estado_reporte = $1,
@@ -161,7 +245,22 @@ function createAdminReportesRouter({ pool }) {
       );
 
       if (result.rows.length === 0) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
-      return res.status(200).json({ status: "success", mensaje: "Estado de reporte actualizado", reporte: result.rows[0] });
+
+      const contextoFinal = { ...contextoAntes, ...result.rows[0] };
+      let notificacionCorreo = { total: 0, enviados: 0, fallidos: [] };
+      if (String(contextoFinal.estado_reporte || "").toUpperCase() !== "PENDIENTE") {
+        notificacionCorreo = await notificarResolucionReporte(contextoFinal).catch((error) => {
+          console.error("Error notificando resolucion:", error);
+          return { total: 0, enviados: 0, fallidos: [] };
+        });
+      }
+
+      return res.status(200).json({
+        status: "success",
+        mensaje: "Estado de reporte actualizado",
+        reporte: result.rows[0],
+        notificacion_correo: notificacionCorreo,
+      });
     } catch (error) {
       console.error(error);
       return res.status(500).json({ status: "error", mensaje: "Error al actualizar reporte" });
@@ -197,6 +296,9 @@ function createAdminReportesRouter({ pool }) {
     if (!razon) return res.status(400).json({ status: "error", mensaje: "razon es obligatoria" });
 
     try {
+      const contexto = await obtenerContextoReporte(id);
+      if (!contexto) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
+
       const result = await pool.query(
         `UPDATE reportes
          SET estado_reporte = 'DESESTIMADO',
@@ -207,12 +309,20 @@ function createAdminReportesRouter({ pool }) {
       );
 
       if (result.rows.length === 0) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
+      const notificacionCorreo = await notificarResolucionReporte(
+        { ...contexto, ...result.rows[0] },
+        razon
+      ).catch((error) => {
+        console.error("Error notificando desestimacion:", error);
+        return { total: 0, enviados: 0, fallidos: [] };
+      });
       return res.status(200).json({ 
         status: "success", 
         mensaje: "Reporte desestimado", 
         accion: "DESESTIMAR",
         razon,
-        reporte: result.rows[0] 
+        reporte: result.rows[0],
+        notificacion_correo: notificacionCorreo,
       });
     } catch (error) {
       console.error(error);
@@ -229,14 +339,8 @@ function createAdminReportesRouter({ pool }) {
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ status: "error", mensaje: "id invalido" });
 
     try {
-      const reporteResult = await pool.query(
-        `SELECT id_usuario FROM reportes WHERE id = $1 LIMIT 1`,
-        [id]
-      );
-
-      if (reporteResult.rows.length === 0) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
-
-      const idUsuario = reporteResult.rows[0].id_usuario;
+      const contexto = await obtenerContextoReporte(id);
+      if (!contexto) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
 
       // Actualizar reporte
       const updateResult = await pool.query(
@@ -248,12 +352,21 @@ function createAdminReportesRouter({ pool }) {
         [id]
       );
 
+      const notificacionCorreo = await notificarResolucionReporte(
+        { ...contexto, ...updateResult.rows[0] },
+        "Advertencia formal"
+      ).catch((error) => {
+        console.error("Error notificando advertencia:", error);
+        return { total: 0, enviados: 0, fallidos: [] };
+      });
+
       return res.status(200).json({ 
         status: "success", 
         mensaje: "Advertencia formal registrada en historial", 
         accion: "ADVERTENCIA_FORMAL",
-        usuario_notificado: idUsuario,
-        reporte: updateResult.rows[0] 
+        usuario_notificado: contexto.id_reportador,
+        reporte: updateResult.rows[0],
+        notificacion_correo: notificacionCorreo,
       });
     } catch (error) {
       console.error(error);
@@ -272,14 +385,8 @@ function createAdminReportesRouter({ pool }) {
     if (!Number.isInteger(dias) || dias <= 0) return res.status(400).json({ status: "error", mensaje: "dias debe ser un numero positivo" });
 
     try {
-      const reporteResult = await pool.query(
-        `SELECT id_usuario FROM reportes WHERE id = $1 LIMIT 1`,
-        [id]
-      );
-
-      if (reporteResult.rows.length === 0) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
-
-      const idUsuario = reporteResult.rows[0].id_usuario;
+      const contexto = await obtenerContextoReporte(id);
+      if (!contexto) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
 
       // Actualizar reporte
       const updateResult = await pool.query(
@@ -291,14 +398,23 @@ function createAdminReportesRouter({ pool }) {
         [id]
       );
 
+      const notificacionCorreo = await notificarResolucionReporte(
+        { ...contexto, ...updateResult.rows[0] },
+        `Suspension por ${dias} dias`
+      ).catch((error) => {
+        console.error("Error notificando suspension:", error);
+        return { total: 0, enviados: 0, fallidos: [] };
+      });
+
       return res.status(200).json({ 
         status: "success", 
         mensaje: `Cuenta suspendida por ${dias} días`, 
         accion: "SUSPENSION_TEMPORAL",
-        usuario_suspendido: idUsuario,
+        usuario_suspendido: contexto.id_reportador,
         duracion_dias: dias,
         fecha_reactivacion: new Date(Date.now() + dias * 24 * 60 * 60 * 1000).toISOString(),
-        reporte: updateResult.rows[0] 
+        reporte: updateResult.rows[0],
+        notificacion_correo: notificacionCorreo,
       });
     } catch (error) {
       console.error(error);
@@ -317,14 +433,8 @@ function createAdminReportesRouter({ pool }) {
     if (!razon) return res.status(400).json({ status: "error", mensaje: "razon es obligatoria" });
 
     try {
-      const reporteResult = await pool.query(
-        `SELECT id_usuario FROM reportes WHERE id = $1 LIMIT 1`,
-        [id]
-      );
-
-      if (reporteResult.rows.length === 0) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
-
-      const idUsuario = reporteResult.rows[0].id_usuario;
+      const contexto = await obtenerContextoReporte(id);
+      if (!contexto) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
 
       // Actualizar reporte
       const updateResult = await pool.query(
@@ -336,13 +446,22 @@ function createAdminReportesRouter({ pool }) {
         [id]
       );
 
+      const notificacionCorreo = await notificarResolucionReporte(
+        { ...contexto, ...updateResult.rows[0] },
+        razon
+      ).catch((error) => {
+        console.error("Error notificando bloqueo:", error);
+        return { total: 0, enviados: 0, fallidos: [] };
+      });
+
       return res.status(200).json({ 
         status: "success", 
         mensaje: "Cuenta bloqueada permanentemente y dispositivos baneados", 
         accion: "BLOQUEO_PERMANENTE",
-        usuario_bloqueado: idUsuario,
+        usuario_bloqueado: contexto.id_reportador,
         razon,
-        reporte: updateResult.rows[0] 
+        reporte: updateResult.rows[0],
+        notificacion_correo: notificacionCorreo,
       });
     } catch (error) {
       console.error(error);
@@ -361,16 +480,11 @@ function createAdminReportesRouter({ pool }) {
     if (!razon) return res.status(400).json({ status: "error", mensaje: "razon es obligatoria" });
 
     try {
-      const reporteResult = await pool.query(
-        `SELECT id_usuario, id_producto, id_servicio FROM reportes WHERE id = $1 LIMIT 1`,
-        [id]
-      );
+      const contexto = await obtenerContextoReporte(id);
+      if (!contexto) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
 
-      if (reporteResult.rows.length === 0) return res.status(404).json({ status: "error", mensaje: "Reporte no encontrado" });
-
-      const { id_usuario: idUsuario, id_producto: idProducto, id_servicio: idServicio } = reporteResult.rows[0];
-      const tipo_objetivo = idProducto ? "producto" : "servicio";
-      const id_objetivo = idProducto || idServicio;
+      const tipo_objetivo = contexto.id_producto ? "producto" : "servicio";
+      const id_objetivo = contexto.id_producto || contexto.id_servicio;
 
       // Actualizar reporte
       const updateResult = await pool.query(
@@ -382,15 +496,24 @@ function createAdminReportesRouter({ pool }) {
         [id]
       );
 
+      const notificacionCorreo = await notificarResolucionReporte(
+        { ...contexto, ...updateResult.rows[0] },
+        razon
+      ).catch((error) => {
+        console.error("Error notificando eliminacion de contenido:", error);
+        return { total: 0, enviados: 0, fallidos: [] };
+      });
+
       return res.status(200).json({ 
         status: "success", 
         mensaje: "Contenido eliminado sin afectar la cuenta", 
         accion: "CONTENIDO_ELIMINADO",
-        usuario: idUsuario,
+        usuario: contexto.id_reportador,
         tipo_objetivo,
         id_objetivo,
         razon,
-        reporte: updateResult.rows[0] 
+        reporte: updateResult.rows[0],
+        notificacion_correo: notificacionCorreo,
       });
     } catch (error) {
       console.error(error);

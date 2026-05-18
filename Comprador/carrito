@@ -60,6 +60,18 @@ function createCompradorCarritoRouter({ pool }) {
 		return creado.rows[0].id;
 	}
 
+	async function obtenerStockDisponibleProducto(client, idProducto) {
+		const stock = await client.query(
+			`SELECT COALESCE(SUM(stock_disponible), 0) AS stock_disponible
+			 FROM lotes_inventario
+			 WHERE id_producto = $1
+			   AND fecha_caducidad >= CURRENT_DATE`,
+			[idProducto]
+		);
+
+		return Number(stock.rows[0]?.stock_disponible || 0);
+	}
+
 	async function obtenerDetalleCarrito(idUsuario) {
 		const result = await pool.query(
 			`SELECT
@@ -301,13 +313,15 @@ function createCompradorCarritoRouter({ pool }) {
 
 			if (tieneProducto) {
 				const producto = await client.query(
-					"SELECT id, stock_total FROM productos WHERE id = $1 AND esta_activo = TRUE LIMIT 1",
+					"SELECT id, nombre FROM productos WHERE id = $1 AND esta_activo = TRUE LIMIT 1",
 					[idProducto]
 				);
 				if (producto.rows.length === 0) {
 					await client.query("ROLLBACK");
 					return res.status(404).json({ mensaje: "Producto no encontrado o inactivo" });
 				}
+
+				const stockDisponible = await obtenerStockDisponibleProducto(client, idProducto);
 
 				const existente = await client.query(
 					`SELECT id, cantidad
@@ -319,7 +333,7 @@ function createCompradorCarritoRouter({ pool }) {
 
 				if (existente.rows.length > 0) {
 					const nuevaCantidad = Number(existente.rows[0].cantidad) + cantidadNum;
-					if (nuevaCantidad > Number(producto.rows[0].stock_total || 0)) {
+					if (nuevaCantidad > stockDisponible) {
 						await client.query("ROLLBACK");
 						return res.status(400).json({ mensaje: "Stock insuficiente para la cantidad solicitada" });
 					}
@@ -329,7 +343,7 @@ function createCompradorCarritoRouter({ pool }) {
 						[cantidadNum, existente.rows[0].id]
 					);
 				} else {
-					if (cantidadNum > Number(producto.rows[0].stock_total || 0)) {
+					if (cantidadNum > stockDisponible) {
 						await client.query("ROLLBACK");
 						return res.status(400).json({ mensaje: "Stock insuficiente para la cantidad solicitada" });
 					}
@@ -429,7 +443,7 @@ function createCompradorCarritoRouter({ pool }) {
 
 			if (item.rows[0].id_producto !== null) {
 				const producto = await client.query(
-					"SELECT stock_total, esta_activo FROM productos WHERE id = $1 LIMIT 1",
+					"SELECT id, esta_activo FROM productos WHERE id = $1 LIMIT 1",
 					[item.rows[0].id_producto]
 				);
 
@@ -438,7 +452,9 @@ function createCompradorCarritoRouter({ pool }) {
 					return res.status(404).json({ mensaje: "Producto no encontrado o inactivo" });
 				}
 
-				if (cantidadNum > Number(producto.rows[0].stock_total || 0)) {
+				const stockDisponible = await obtenerStockDisponibleProducto(client, item.rows[0].id_producto);
+
+				if (cantidadNum > stockDisponible) {
 					await client.query("ROLLBACK");
 					return res.status(400).json({ mensaje: "Stock insuficiente para la cantidad solicitada" });
 				}

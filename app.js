@@ -4,6 +4,7 @@ const { Pool } = require("pg");
 const createLoginRouter = require("./Login/APIs");
 const createAdminRouter = require("./Admin/routes");
 const createAdminReportesRouter = require("./Admin/reportes");
+const createAdminNotificacionesRouter = require("./Admin/notificaciones");
 const createVendedorRouter = require("./Vendedor/CRUD");
 const createVendedorOrdersRouter = require("./Vendedor/Pedidos");
 const createVendedorBusinessRouter = require("./Vendedor/Negocio");
@@ -65,6 +66,12 @@ app.use(
 
 app.use(
   createAdminReportesRouter({
+    pool,
+  })
+);
+
+app.use(
+  createAdminNotificacionesRouter({
     pool,
   })
 );

@@ -569,6 +569,73 @@ function createCompradorRouter({ pool }) {
     }
   });
 
+  // Obtener recomendaciones
+  router.get("/comprador/home/recomendaciones/:idUsuario", async (req, res) => {
+    const idUsuario = Number(req.params.idUsuario);
+    const limite = req.query.limite ? Number(req.query.limite) : 5;
+
+    if (!Number.isInteger(idUsuario) || idUsuario <= 0) {
+      return res.status(400).json({ mensaje: "idUsuario inválido" });
+    }
+
+    try {
+      const iaBridgeUrl = `http://127.0.0.1:8000/recomendaciones/home/${idUsuario}?limite=${limite}`;
+      
+      const response = await fetch(iaBridgeUrl);
+      
+      if (!response.ok) {
+        throw new Error(`El Bridge de IA respondió con estado: ${response.status}`);
+      }
+
+      const datosIA = await response.json();
+
+      return res.status(200).json(datosIA);
+
+    } catch (error) {
+      console.error("Error al conectar con el Bridge de IA:", error.message);
+      try {
+        console.warn("Fallback");
+        const fallbackResult = await pool.query(
+          `SELECT p.id, p.nombre, p.calificacion, p.precio, pi.url_imagen AS imagen_principal
+           FROM productos p
+           LEFT JOIN producto_imagenes pi ON pi.id_producto = p.id AND pi.es_principal = TRUE
+           WHERE p.esta_activo = TRUE AND p.stock_total > 0
+           ORDER BY p.calificacion DESC NULLS LAST, p.fecha_registro DESC
+           LIMIT $1`, [limite]
+        );
+
+        return res.status(200).json({
+          usuario_id: idUsuario,
+          tipo_usuario: "fallback_traditional",
+          perfil: "[FALLBACK] Módulo de IA no disponible temporalmente",
+          carruseles: [
+            {
+              nombre: "Productos Destacados",
+              items: fallbackResult.rows.map(row => ({
+                item_id: `P-${row.id}`,
+                tipo: "producto",
+                nombre: row.nombre,
+                precio_unitario: Number(row.precio),
+                precio_final: Number(row.precio),
+                cantidad_sugerida: 1,
+                precio_total: Number(row.precio),
+                etiqueta: "Destacado",
+                calificacion: row.calificacion ? Number(row.calificacion) : 0
+              })),
+              presupuesto_seccion: fallbackResult.rows.reduce((sum, r) => sum + Number(r.precio), 0)
+            }
+          ],
+          total_items: fallbackResult.rows.length,
+          generated_at: new Date().toISOString()
+        });
+
+      } catch (dbError) {
+        console.error(dbError);
+        return res.status(500).json({ mensaje: "Error al obtener recomendaciones" });
+      }
+    }
+  });
+
   // Consultar detalle de un producto
   router.get("/comprador/productos/:idProducto", async (req, res) => {
     const idProducto = Number(req.params.idProducto);
